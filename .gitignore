@@ -1,0 +1,7 @@
+bin/
+obj/
+out/
+*.elf
+__pycache__/
+*.pyc
+.mcp.json

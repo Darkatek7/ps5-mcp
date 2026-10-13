@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "ps5": {
+      "command": "python",
+      "args": ["/path/to/ps5-mcp/server/server.py"],
+      "env": {
+        "PS5_IP": "192.168.1.50"
+      }
+    }
+  }
+}

@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- RemoteEye: the virtual controller payload behind the ps5 MCP server. Built with SharpProspero. -->
+  <PropertyGroup>
+    <SharpProsperoRoot Condition="'$(SharpProsperoRoot)' == ''">$(SHARPPROSPERO_ROOT)</SharpProsperoRoot>
+  </PropertyGroup>
+
+  <Import Project="$(SharpProsperoRoot)\build\Prospero.Payload.props" />
+
+  <PropertyGroup>
+    <RootNamespace>RemoteEye</RootNamespace>
+    <AssemblyName>RemoteEye</AssemblyName>
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>14.0</LangVersion>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="$(SharpProsperoRoot)\src\SharpProspero\SharpProspero.csproj" />
+  </ItemGroup>
+
+  <Import Project="$(SharpProsperoRoot)\build\Prospero.Payload.targets" />
+
+</Project>
