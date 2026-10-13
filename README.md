@@ -10,7 +10,7 @@ Claude ── MCP (stdio) ── server.py ──┬── TCP ── RemoteEye 
 ```
 
 - **Input:** the `RemoteEye` payload adds a *virtual controller* through the same kernel device Remote Play
-  uses and feeds it button and stick states. Works in the system UI and inside apps and games.
+  uses and feeds it button and stick states. Verified in the system UI and inside homebrew apps.
 - **Screen:** the virtual controller holds **Create**, the console saves a screenshot to its gallery, and
   the server fetches it over FTP and scales it down (~4 s per screenshot, full composited screen).
 
@@ -60,8 +60,10 @@ Buttons: `cross circle square triangle up down left right l1 r1 l2 r2 l3 r3 opti
    claude mcp add ps5 --env PS5_IP=192.168.1.50 -- python /path/to/ps5-mcp/server/server.py
    ```
    or copy `.mcp.json.example` to `.mcp.json` in your project and set the paths and IP.
-4. First use: a new controller appears on the console and it asks **"Who's using this controller?"**.
-   Let Claude answer it (`ps5_press right`, then `ps5_press cross`) or pick your user on the real controller.
+4. First use: a new controller appears and the console asks **"Who's using this controller?"** on its
+   first input. Pick your user there — with your real controller, or let Claude do it (`ps5_press` to move,
+   `cross` to select). Until then screenshots fail, since the Create button of an unassigned controller does
+   nothing.
 
 ### Configuration
 
@@ -80,7 +82,8 @@ clear them in the Media Gallery from time to time.
 ## Building RemoteEye
 
 RemoteEye is written in C# and compiled to a payload ELF with
-[SharpProspero](https://github.com/SvenGDK/SharpProspero). Clone it next to this repository (or set
+[SharpProspero](https://github.com/SvenGDK/SharpProspero). Release builds are made from SharpProspero
+commit `5dfdb4b0b166e83dc9ae275001afb695f12c7174`, unmodified. Clone it next to this repository (or set
 `SHARPPROSPERO_ROOT`), install its prerequisites, then:
 
 ```

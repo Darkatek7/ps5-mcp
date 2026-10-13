@@ -42,7 +42,7 @@ internal static unsafe class Program
     // keeps receiving, so each build listens on PortBase + BuildTag. Raise BuildTag on each rebuild; the
     // PC scans the range for the newest.
     private const ushort PortBase = 3320;
-    private const int BuildTag = 1;
+    private const int BuildTag = 3;
     private const int MaxLine = 256;
 
     private const int SysIoctl = 54;

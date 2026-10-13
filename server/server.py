@@ -393,18 +393,24 @@ def ps5_status() -> str:
         except OSError:
             lines.append(f"{name} ({port}): down")
     with _lock:
-        found = None
-        for port in ([eye.port] if eye.port else []) + list(REMOTEEYE_PORTS):
-            kind, _, sock = eye.probe(port)
+        # Older instances keep running (a payload can't be unloaded); the server uses the newest.
+        newest, busy = None, []
+        for port in REMOTEEYE_PORTS:
+            kind, tag, sock = eye.probe(port)
             if kind == "ok":
                 sock.sendall(b"PING\n")
-                found = sock.makefile("rb").readline().decode().strip()
+                reply = sock.makefile("rb").readline().decode().strip()
                 sock.close()
-                break
-            if kind == "busy":
-                found = f"port {port} busy with another client"
-                break
-        lines.append("remoteeye: " + (found or "not running (it is started on first use)"))
+                if newest is None or tag > newest[0]:
+                    newest = (tag, reply)
+            elif kind == "busy":
+                busy.append(port)
+        if newest:
+            lines.append("remoteeye: " + newest[1])
+        if busy:
+            lines.append(f"remoteeye: port(s) {busy} busy with another client")
+        if not newest and not busy:
+            lines.append("remoteeye: not running (it is started on first use)")
     return "\n".join(lines)
 
 
