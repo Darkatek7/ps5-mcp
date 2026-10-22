@@ -50,7 +50,9 @@ same ioctls:
 - `state` (0xA8 bytes): buttons at 0xC (ScePadButton bits), sticks lx ly rx ry at 0x10, L2/R2 at 0x14,
   a 1 at 0x17, touch count at 0x1C, motion data from 0x78.
 
-A state stays in effect until the next one. The system treats the device as a new controller and asks who is
+RemoteEye's `STATE` command fills buttons, sticks and triggers; `BLOCK` (v4) takes a whole state block in hex,
+so fields like the touch points can be tried from the PC without another build. A state stays in effect until
+the next one. The system treats the device as a new controller and asks who is
 using it; once a user is picked, the shell and apps read it like a real pad.
 
 Button bits used: Create `0x1`, L3 `0x2`, R3 `0x4`, Options `0x8`, Up `0x10`, Right `0x20`, Down `0x40`,
@@ -61,8 +63,23 @@ Cross `0x4000`, Square `0x8000`, PS `0x10000`, Touchpad `0x100000`.
 
 Rather than capturing frames inside a payload, the tool lets the system do it: holding Create on the virtual
 controller makes the console save a screenshot (`/user/av_contents/photo/<title id>/<title id>/<n>/*.jxr`
-with HDR output). The server lists the gallery with one FTP `MLSD` per directory, waits for the new file's
-size to settle, downloads it and decodes JPEG XR with the Windows Imaging Component.
+with HDR output, plus `.meta` and `.dat`). A gallery collects hundreds of `<n>` folders, and listing all of
+them on every poll added ~20 s to a screenshot once ~430 had piled up. Instead the server lists the folders
+down to `<n>` with their modify times (about a dozen `MLSD` calls) before and after, and only looks inside
+folders whose time changed. It waits for the new file's size to settle, downloads it and decodes it.
+
+Finding RemoteEye took another ~20 s on the first call: the console lets connections to closed ports time out
+rather than refusing them, so the 20 ports are probed in parallel.
+
+HDR screenshots hold 16-bit PQ (SMPTE ST 2084) values. The Windows Imaging Component turns them into a normal
+8-bit picture; elsewhere the server decodes them with `imagecodecs`, converts PQ to nits, takes 250 nits as
+white and applies the sRGB curve, which matches the WIC output to about one level on average.
+
+## The log
+
+klogsrv sends every kernel log line to every connected client, so the server keeps one connection open in the
+background and stamps each line with the time it arrived. `ps5_klog(since_s=...)` can then show what was logged
+before the call, and other log readers still get every line.
 
 Deleting the files afterwards over FTP leaves the gallery's database entry behind, shown as a blank tile in
 the Media Gallery, so that is opt-in.

@@ -27,6 +27,8 @@
 //   ATTACH <userhex> [type]            open /dev/hid and add the controller (type defaults to 1);
 //                                      reports the existing one when already attached
 //   STATE <btnhex> [lx ly rx ry l2 r2] feed one state (sticks default to centre 128, triggers to 0)
+//   BLOCK <hex>                        feed a whole state block, up to 0xA8 bytes in hex (the rest is
+//                                      zero); for fields STATE does not set, such as touch points
 //   DETACH                             remove the controller
 
 using System;
@@ -42,8 +44,8 @@ internal static unsafe class Program
     // keeps receiving, so each build listens on PortBase + BuildTag. Raise BuildTag on each rebuild; the
     // PC scans the range for the newest.
     private const ushort PortBase = 3320;
-    private const int BuildTag = 3;
-    private const int MaxLine = 256;
+    private const int BuildTag = 4;
+    private const int MaxLine = 512;
 
     private const int SysIoctl = 54;
     private const ulong IoctlAdd = 0xC018482A;
@@ -103,6 +105,8 @@ internal static unsafe class Program
                 ServeAttach(client, line + 7);
             else if (StartsWith(line, "STATE "))
                 ServeState(client, line + 6);
+            else if (StartsWith(line, "BLOCK "))
+                ServeBlock(client, line + 6);
             else if (StartsWith(line, "DETACH"))
                 ServeDetach(client);
             else
@@ -193,7 +197,35 @@ internal static unsafe class Program
         *(uint*)(state + 0xC) = buttons;
         for (int i = 0; i < 6; i++) state[0x10 + i] = analog[i];
         state[0x17] = 1;
+        Insert(client, state);
+    }
 
+    private static void ServeBlock(int client, byte* args)
+    {
+        if (Handle < 0) { Send(client, "ERR not attached\n"u8); return; }
+
+        byte* state = stackalloc byte[BlockSize];
+        Clear(state, BlockSize);
+        while (*args == (byte)' ') args++;
+        int count = 0;
+        while (count < BlockSize)
+        {
+            int high = HexDigit(args[0]);
+            int low = high < 0 ? -1 : HexDigit(args[1]);
+            if (low < 0) break;
+            state[count++] = (byte)(high << 4 | low);
+            args += 2;
+        }
+        if (*args != 0 && *args != (byte)' ')
+        {
+            Send(client, "ERR usage: BLOCK <up to 0xA8 bytes in hex>\n"u8);
+            return;
+        }
+        Insert(client, state);
+    }
+
+    private static void Insert(int client, byte* state)
+    {
         ulong* request = stackalloc ulong[3];
         request[0] = (uint)Handle;
         request[1] = (ulong)state;
@@ -280,10 +312,7 @@ internal static unsafe class Program
         ulong value = 0;
         while (true)
         {
-            byte c = *text;
-            int d = c >= (byte)'0' && c <= (byte)'9' ? c - '0'
-                  : c >= (byte)'a' && c <= (byte)'f' ? c - 'a' + 10
-                  : c >= (byte)'A' && c <= (byte)'F' ? c - 'A' + 10 : -1;
+            int d = HexDigit(*text);
             if (d < 0) break;
             value = (value << 4) | (uint)d;
             text++;
@@ -291,6 +320,11 @@ internal static unsafe class Program
         while (*text == (byte)' ') text++;
         return value;
     }
+
+    private static int HexDigit(byte c)
+        => c >= (byte)'0' && c <= (byte)'9' ? c - '0'
+         : c >= (byte)'a' && c <= (byte)'f' ? c - 'a' + 10
+         : c >= (byte)'A' && c <= (byte)'F' ? c - 'A' + 10 : -1;
 
     private static int ParseInt(byte* text)
     {
