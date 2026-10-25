@@ -163,7 +163,11 @@ They run without a console, against a fake RemoteEye, klogsrv and FTP server.
 ## Limitations
 
 - One virtual controller, user 1 by default. The console may show a controller-assignment prompt after
-  RemoteEye starts.
+  RemoteEye starts (also after every console restart). While that prompt is open, the real controller can't do
+  anything either; `ps5_detach` closes it.
+- Input is sent like a real controller sends it: a held button is reported again every 20 ms (`PS5_REPORT_MS`),
+  the release three times, and a controller that was just added gets a second before the first input. With one
+  report per press, presses were lost while a real DualSense was in use as well.
 - Touch input (`ps5_touch`) is unverified: where the touch points go in the virtual pad's state is assumed
   from `ScePadTouchData`, not read from the firmware.
 - `ps5_close` ends a title through the system, like *Close App*. Apps that render with the GPU are better

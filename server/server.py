@@ -75,6 +75,13 @@ SAVE_DIR = Path(os.environ["PS5_SAVE_DIR"]) if os.environ.get("PS5_SAVE_DIR") el
 IMAGE_SUFFIXES = (".jxr", ".png", ".jpg", ".jpeg")
 DOWNLOAD_DIR = Path(tempfile.gettempdir()) / "ps5-mcp"
 INLINE_TEXT_LIMIT = 64 * 1024
+# A real controller reports its state every few milliseconds. A press sent as one "down" and one "up" report was
+# lost on a console where a real DualSense was also in use (only Create held for a screenshot, which is re-sent
+# every 100 ms, came through), so a held state is re-sent every REPORT_INTERVAL_S and the release a few times.
+REPORT_INTERVAL_S = int(os.environ.get("PS5_REPORT_MS", "20")) / 1000
+RELEASE_REPORTS = 3
+# A controller that was just added is opened by the system first; input sent at once is dropped.
+NEW_PAD_SETTLE_S = 1.0
 
 # ScePadButton bits. Create is the bit the system answers with a screenshot when it is held.
 BUTTONS = {
@@ -227,6 +234,8 @@ class RemoteEye:
         reply = self.call(f"ATTACH {user_id():x} 1")
         if not reply.startswith("OK"):
             raise RuntimeError(reply)
+        if reply.endswith(" new"):
+            self.wait(NEW_PAD_SETTLE_S)
         return reply
 
     def state(self, buttons: int = 0, lx: int = 128, ly: int = 128, rx: int = 128, ry: int = 128,
@@ -471,20 +480,37 @@ def decode_jxr(raw: bytes, max_width: int) -> PILImage.Image:
 
 # ---- what the tools do; callers hold _lock and an eye.session() ----
 
+def _hold(seconds: float, bits: int, lx: int = 128, ly: int = 128, rx: int = 128, ry: int = 128) -> None:
+    """Holds a state for `seconds`, re-sending it like a real controller does (see REPORT_INTERVAL_S); sent at
+    least once."""
+    l2, r2 = 255 if bits & BUTTONS["l2"] else 0, 255 if bits & BUTTONS["r2"] else 0
+    end = time.time() + seconds
+    while True:
+        eye.state(bits, lx, ly, rx, ry, l2, r2)
+        left = end - time.time()
+        if left <= 0:
+            return
+        time.sleep(min(left, REPORT_INTERVAL_S))
+
+
+def _release() -> None:
+    for i in range(RELEASE_REPORTS):
+        if i:
+            time.sleep(REPORT_INTERVAL_S)
+        eye.state(0)
+
+
 def _press(bits: int, hold_ms: int, repeat: int, gap_ms: int) -> None:
     for i in range(max(1, repeat)):
-        eye.state(bits, l2=255 if bits & BUTTONS["l2"] else 0, r2=255 if bits & BUTTONS["r2"] else 0)
-        time.sleep(hold_ms / 1000)
-        eye.state(0)
+        _hold(hold_ms / 1000, bits)
+        _release()
         if i + 1 < repeat:
             time.sleep(gap_ms / 1000)
 
 
 def _stick(lx: float, ly: float, rx: float, ry: float, duration_ms: int, bits: int) -> None:
-    eye.state(bits, axis(lx), axis(ly), axis(rx), axis(ry),
-              255 if bits & BUTTONS["l2"] else 0, 255 if bits & BUTTONS["r2"] else 0)
-    eye.wait(duration_ms / 1000)
-    eye.state(0)
+    _hold(duration_ms / 1000, bits, axis(lx), axis(ly), axis(rx), axis(ry))
+    _release()
 
 
 def touch_block(points: list[tuple[float, float]], bits: int = 0) -> bytes:

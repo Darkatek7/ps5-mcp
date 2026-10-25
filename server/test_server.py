@@ -164,6 +164,8 @@ class FakeEye(threading.Thread):
         if line == "PING":
             return f"OK PONG {EYE.getsockname()[1]} v{self.tag} remoteeye handle={self.handle}"
         if line.startswith("ATTACH"):
+            if self.handle == 7:
+                return "OK handle=7 existing"
             self.handle = 7
             return "OK handle=7 new"
         if line.startswith("STATE"):
@@ -272,7 +274,25 @@ class Input(unittest.TestCase):
     def test_press(self):
         self.assertEqual(srv.ps5_press("cross", hold_ms=0, repeat=2, gap_ms=0), "pressed cross x2")
         states = [l for l in eye_server.lines if l.startswith("STATE")]
-        self.assertEqual(states, ["STATE 4000 128 128 128 128 0 0", "STATE 0 128 128 128 128 0 0"] * 2)
+        release = ["STATE 0 128 128 128 128 0 0"] * srv.RELEASE_REPORTS
+        self.assertEqual(states, (["STATE 4000 128 128 128 128 0 0"] + release) * 2)
+
+    def test_a_held_press_is_reported_again_and_again_like_a_real_controller(self):
+        srv.ps5_press("right", hold_ms=100)
+        states = [l for l in eye_server.lines if l.startswith("STATE")]
+        down = [l for l in states if not l.startswith("STATE 0 ")]
+        self.assertGreaterEqual(len(down), 3)
+        self.assertTrue(all(l == down[0] for l in down))
+        self.assertEqual(states[len(down):], ["STATE 0 128 128 128 128 0 0"] * srv.RELEASE_REPORTS)
+
+    def test_a_new_controller_gets_time_before_the_first_input(self):
+        eye_server.handle = -1   # RemoteEye adds the controller on this call
+        start = time.time()
+        srv.ps5_press("cross", hold_ms=0)
+        self.assertGreaterEqual(time.time() - start, srv.NEW_PAD_SETTLE_S)
+        start = time.time()
+        srv.ps5_press("cross", hold_ms=0)   # the controller is there now: no wait
+        self.assertLess(time.time() - start, srv.NEW_PAD_SETTLE_S)
 
     def test_touch_block(self):
         block = srv.touch_block([(1.0, 0.0)], srv.BUTTONS["touchpad"])
