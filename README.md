@@ -1,24 +1,30 @@
 # ps5-mcp
 
 Give Claude (or any MCP client) eyes and hands on a jailbroken PS5: it can **take screenshots** of whatever
-is on screen, **press controller buttons**, **move files** to and from the console and **read its log**. That
-turns homebrew development into a loop the AI can run by itself — deploy, launch, look, press, look again —
-without a capture card or Remote Play.
+is on screen, **press controller buttons**, **start and close titles**, **move files** to and from the console
+and **read its log**. That turns homebrew development into a loop the AI can run by itself — deploy, launch,
+look, press, look again, close — without a capture card or Remote Play.
 
 ```
 Claude ── MCP (stdio) ── server.py ──┬── TCP ── RemoteEye payload ── /dev/hid ── virtual controller
-                                     └── FTP ── ftpsrv ── screenshot from the console's gallery
+                                     ├── FTP ── ftpsrv ── screenshot from the console's gallery
+                                     └── elfldr ── titlectl payload ── start / close titles, browser
+                                                        └── result via klogsrv
 ```
 
 - **Input:** the `RemoteEye` payload adds a *virtual controller* through the same kernel device Remote Play
   uses and feeds it button and stick states. Verified in the system UI and inside homebrew apps.
 - **Screen:** the virtual controller holds **Create**, the console saves a screenshot to its gallery, and
   the server fetches it over FTP and scales it down (~4 s per screenshot, full composited screen).
+- **Titles:** the small `titlectl` payload asks the system to start or close a title, names the app in front
+  or opens the web browser. The server writes the title id into the ELF before sending it, and reads the
+  answer back from the kernel log (~0.5 s per call).
 - **Files and log:** ftpsrv for files, klogsrv for the kernel log, which the server reads continuously so it
   can show what happened *before* a call, e.g. right before a crash.
 
 > Tested on **firmware 13.00** only. The ioctl numbers and request layouts were read from that firmware's
-> `libScePad`; other firmwares may differ. Reports welcome.
+> `libScePad`; other firmwares may differ. Release builds include the SDK fix that lets payloads start on
+> 13.40 and later (see [Building RemoteEye](#building-remoteeye)). Reports welcome.
 
 ## Tools
 
@@ -32,12 +38,23 @@ Claude ── MCP (stdio) ── server.py ──┬── TCP ── RemoteEye 
 | `ps5_detach()` | Remove the virtual controller (when it is stuck or bound to the wrong user) |
 | `ps5_klog(seconds, filter, since_s)` | Kernel log (payload output, crashes): the next `seconds`, plus the last `since_s` before the call |
 | `ps5_send_payload(path, log_seconds)` | Send an ELF to the loader on port 9021, optionally return its log output |
+| `ps5_titles(contains)` | Installed titles with their names |
+| `ps5_running()` | The app in front (title id and name), or the home screen |
+| `ps5_launch(title_id)` | Start a title, e.g. `"PPSA01234"` |
+| `ps5_close(title_id, quit_file, timeout_s)` | Close a title the way the system's *Close App* does; or, with `quit_file`, write the file an app of your own watches and wait until it has ended itself |
+| `ps5_open_url(url)` | Open the console's web browser at a URL (as a card over the running app) |
+| `ps5_rescan()` | Ask ShadowMountPlus to register newly uploaded homebrew (`/data/homebrew/<title id>`) |
+| `ps5_processes(contains)` | The console's process list (pid, state, name, wait channel); needs RemoteEye v6 |
+| `ps5_kill_payload(pid)` | End a hanging payload (`payload.elf` only, never a title or system process); needs RemoteEye v6 |
 | `ps5_ls(path)` | List a folder on the console |
 | `ps5_upload(local_path, remote_path)` | Copy a file or folder to the console |
 | `ps5_download(remote_path, local_path)` | Copy a file or folder from the console; small text files are returned directly |
 | `ps5_delete(remote_path, recursive)` | Delete a file, or a folder with `recursive=true` |
 | `ps5_move(from_path, to_path)` | Rename or move on the console |
 | `ps5_status()` | Which console services answer, user, RemoteEye version and controller |
+
+A typical homebrew loop: `ps5_upload` the app to `/data/homebrew/`, `ps5_rescan`, `ps5_launch`,
+`ps5_screenshot` and `ps5_press` to try it, `ps5_klog(since_s=30)` if it crashed, `ps5_close` when done.
 
 `ps5_sequence` saves a round trip per step, e.g. `[{"action": "press", "buttons": "down", "repeat": 3},
 {"action": "press", "buttons": "cross"}, {"action": "wait", "duration_ms": 2000}, {"action": "screenshot"}]`.
@@ -49,7 +66,9 @@ Buttons: `cross circle square triangle up down left right l1 r1 l2 r2 l3 r3 opti
 **Console** (jailbroken, FW 13.00 tested), running:
 - an ELF loader on port **9021** (elfldr)
 - **ftpsrv** on port 2121
-- optional: **klogsrv** on port 3232 for `ps5_klog` and `log_seconds`
+- **klogsrv** on port 3232 for `ps5_klog`, `log_seconds` and the title tools (they read titlectl's answer
+  from the log)
+- optional: **ShadowMountPlus** with its API on port 10101 for `ps5_rescan`
 
 **Console settings:**
 - *Settings → Captures and Broadcasts → Shortcuts for Create Button* must be **Standard** (holding Create
@@ -63,8 +82,8 @@ Buttons: `cross circle square triangle up down left right l1 r1 l2 r2 l3 r3 opti
 
 ## Setup
 
-1. Get `RemoteEye.elf` from the [releases](../../releases) and put it in the repository root
-   (or build it, see below). You don't have to send it yourself — the server starts it on first use.
+1. Get `RemoteEye.elf` and `titlectl.elf` from the [releases](../../releases) and put them in the repository
+   root (or build them, see below). You don't have to send them yourself — the server does when needed.
 2. Install the Python dependencies:
    ```
    pip install -r server/requirements.txt
@@ -87,6 +106,8 @@ Buttons: `cross circle square triangle up down left right l1 r1 l2 r2 l3 r3 opti
 | `PS5_USER_ID` | first folder under `/user/home` | User id in hex |
 | `PS5_FTP_PORT` / `PS5_FTP_USER` / `PS5_FTP_PASS` | `2121` / `anonymous` / `anonymous` | ftpsrv login |
 | `PS5_REMOTEEYE_ELF` | `payload/RemoteEye/out/RemoteEye.elf`, then `./RemoteEye.elf` | Payload to start |
+| `PS5_TITLECTL_ELF` | `payload/titlectl/out/titlectl.elf`, then `./titlectl.elf` | Payload for the title tools |
+| `PS5_SMP_PORT` | `10101` | ShadowMountPlus API port |
 | `PS5_DELETE_SHOTS` | off | Delete each screenshot after fetching it (see below) |
 | `PS5_SAVE_DIR` | — | Keep the original full-resolution file of every screenshot in this folder |
 | `PS5_ELFLDR_PORT` / `PS5_KLOG_PORT` / `PS5_REMOTEEYE_PORTS` | `9021` / `3232` / `3321-3340` | Other ports |
@@ -98,9 +119,16 @@ clear them in the Media Gallery from time to time.
 ## Building RemoteEye
 
 RemoteEye is written in C# and compiled to a payload ELF with
-[SharpProspero](https://github.com/SvenGDK/SharpProspero). Release builds are made from SharpProspero
-commit `5dfdb4b0b166e83dc9ae275001afb695f12c7174`, unmodified. Clone it next to this repository (or set
-`SHARPPROSPERO_ROOT`), install its prerequisites, then:
+[SharpProspero](https://github.com/SvenGDK/SharpProspero). Release builds are made from SharpProspero commit
+`e78aaa107cfba578139e9baf6d76a34d2785befc` (branch `sharpprospero-crt-allproc-fw13` of
+[Darkatek7/SharpProspero](https://github.com/Darkatek7/SharpProspero), proposed upstream as
+[SvenGDK/SharpProspero#6](https://github.com/SvenGDK/SharpProspero/pull/6)). It is the earlier pin
+`5dfdb4b` plus one fix: that version's payload runtime looked for the kernel's process list at the 13.00
+address on every 13.x firmware, so on 13.40 and later a payload stopped before its own code ran. Once the fix
+is merged upstream, any later SharpProspero works too.
+
+Clone it next to this repository as `SharpProspero` (or set `SHARPPROSPERO_ROOT`), install its prerequisites,
+then:
 
 ```
 pwsh ./payload/build.ps1                      # -> payload/RemoteEye/out/RemoteEye.elf
@@ -112,6 +140,17 @@ listens on `3320 + BuildTag`; raise `BuildTag` in `Program.cs` when you change i
 newest instance it finds on 3321–3340 (and removes the controller of any older one, so only one is left).
 The server only starts RemoteEye itself when none is running; to switch to a new build, send it
 (`-Send`, or `ps5_send_payload`). The console may then ask once more who is using the controller.
+
+## Building titlectl
+
+titlectl is C, built with the [PS5 payload SDK](https://github.com/ps5-payload-dev/sdk) (Linux or WSL):
+
+```
+PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk bash payload/titlectl/build.sh   # -> payload/titlectl/out/titlectl.elf
+```
+
+It has no command line: the server finds the marker `PS5MCP-ARGS-V1:` in the ELF and writes the action and
+title id after it before each send, so the one build serves every title.
 
 ## Tests
 
@@ -127,7 +166,9 @@ They run without a console, against a fake RemoteEye, klogsrv and FTP server.
   RemoteEye starts.
 - Touch input (`ps5_touch`) is unverified: where the touch points go in the virtual pad's state is assumed
   from `ScePadTouchData`, not read from the firmware.
-- No starting or closing apps: the system services for that hang when called from a payload.
+- `ps5_close` ends a title through the system, like *Close App*. Apps that render with the GPU are better
+  ended on their own terms: give them a quit file to watch and use `quit_file`. Titles are never killed.
+- `ps5_launch` starts a title for the user in front; homebrew must be registered first (`ps5_rescan`).
 - Screenshots take ~4 s and appear in the gallery. Screens that forbid captures can't be seen.
 - Holding Create shows a short "screenshot saved" notification that may appear in the next screenshot.
 - RemoteEye serves one client at a time; a second MCP session waits until the first call is done.
@@ -139,4 +180,7 @@ See [docs/how-it-works.md](docs/how-it-works.md) for how the virtual controller 
 
 ## License
 
-GPL-3.0, like SharpProspero, which RemoteEye is built with and statically links.
+GPL-3.0, like SharpProspero, which RemoteEye is built with and statically links. titlectl's launch and close
+calls follow [ps5-homebrew-dev-protocol](https://github.com/manoma080/ps5-homebrew-dev-protocol)
+(BlackBearReloaded), which takes them from John Törnblom's shsrv and websrv
+([ps5-payload-dev](https://github.com/ps5-payload-dev)); both are GPL-3.0.

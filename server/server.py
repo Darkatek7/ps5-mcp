@@ -4,13 +4,15 @@ Input goes through the RemoteEye payload (payload/RemoteEye), a virtual controll
 captured by the console itself: holding that controller's Create button saves a screenshot to the gallery,
 which is fetched over FTP, decoded and scaled down here.
 
-Console services it uses: elfldr (9021) to start RemoteEye and other payloads, ftpsrv (2121) for screenshots
-and files, klogsrv (3232) for the log, and RemoteEye on 3320 + its build tag.
+Console services it uses: elfldr (9021) to start RemoteEye, titlectl and other payloads, ftpsrv (2121) for
+screenshots and files, klogsrv (3232) for the log, RemoteEye on 3320 + its build tag, and optionally
+ShadowMountPlus's API (10101) to register uploaded apps.
 
 Configuration (environment):
   PS5_IP          console address (required)
   PS5_REMOTEEYE_ELF  path to RemoteEye.elf; default: payload/RemoteEye/out/RemoteEye.elf, then RemoteEye.elf
                      in the repository root (where a release download goes)
+  PS5_TITLECTL_ELF   path to titlectl.elf (starting and closing titles, the browser); the same two places
   PS5_USER_ID     user id in hex; default: the first folder under /user/home
   PS5_FTP_PORT    ftpsrv port (default 2121)
   PS5_FTP_USER    FTP user (default anonymous)
@@ -20,11 +22,13 @@ Configuration (environment):
                     tile in the Media Gallery. Left on, the screenshots pile up there instead.
   PS5_SAVE_DIR    keep the original (full resolution) file of every screenshot in this folder
   PS5_ELFLDR_PORT / PS5_KLOG_PORT / PS5_REMOTEEYE_PORTS  other ports (default 9021 / 3232 / 3321-3340)
+  PS5_SMP_PORT    ShadowMountPlus API port (default 10101)
 """
 
 from __future__ import annotations
 
 import ftplib
+import json
 import os
 import re
 import socket
@@ -33,6 +37,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.request
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -58,6 +63,10 @@ REPO = Path(__file__).resolve().parents[1]
 REMOTEEYE_ELF = Path(os.environ["PS5_REMOTEEYE_ELF"]) if os.environ.get("PS5_REMOTEEYE_ELF") else next(
     (p for p in (REPO / "payload" / "RemoteEye" / "out" / "RemoteEye.elf", REPO / "RemoteEye.elf") if p.exists()),
     REPO / "RemoteEye.elf")
+TITLECTL_ELF = Path(os.environ["PS5_TITLECTL_ELF"]) if os.environ.get("PS5_TITLECTL_ELF") else next(
+    (p for p in (REPO / "payload" / "titlectl" / "out" / "titlectl.elf", REPO / "titlectl.elf") if p.exists()),
+    REPO / "titlectl.elf")
+SMP_PORT = int(os.environ.get("PS5_SMP_PORT", "10101"))
 JXR2PNG = Path(__file__).with_name("jxr2png.ps1")
 GALLERY = "/user/av_contents/photo"
 THUMBNAILS = "/user/av_contents/thumbnails/photo"
@@ -84,8 +93,14 @@ STATE_SIZE = 0xA8
 TOUCH_COUNT_AT = 0x1C
 TOUCH_POINTS_AT = (0x24, 0x2C)
 TOUCHPAD_SIZE = (1920, 1080)
-# RemoteEye build that understands BLOCK (a whole state block), which touch input needs.
+# RemoteEye builds that understand BLOCK (a whole state block, which touch input needs) and PS/KILL.
 BLOCK_TAG = 4
+PS_TAG = 6
+
+# titlectl's argument slot: the marker, its NUL, then "<action>\0<argument>\0" in what is left of 1040 bytes.
+TITLECTL_MARKER = b"PS5MCP-ARGS-V1:"
+TITLECTL_ROOM = 1040 - len(TITLECTL_MARKER) - 1
+TITLE_ID = re.compile(r"^[A-Z]{4}\d{5}$")
 
 mcp = FastMCP("ps5")
 _lock = threading.Lock()
@@ -220,6 +235,17 @@ class RemoteEye:
         if not reply.startswith("OK"):
             raise RuntimeError(reply)
 
+    def lines(self, line: str) -> list[str]:
+        """Sends a request whose answer is "OK", lines, then "END"; returns the lines."""
+        reply = self.call(line)
+        if not reply.startswith("OK"):
+            raise RuntimeError(reply)
+        out = []
+        while (row := self.reader.readline().decode()) and row.rstrip("\n") != "END":
+            out.append(row.rstrip("\n"))
+        self.last_call = time.time()
+        return out
+
     def block(self, block: bytes) -> None:
         """Feeds a whole state block (RemoteEye v4 and later)."""
         if self.tag < BLOCK_TAG:
@@ -318,9 +344,9 @@ def user_id() -> int:
     return _user_id
 
 
-def send_elf(path: Path) -> None:
+def send_elf(path: Path | bytes) -> None:
     with socket.create_connection((IP, ELFLDR_PORT), timeout=10) as s:
-        s.sendall(path.read_bytes())
+        s.sendall(path if isinstance(path, bytes) else path.read_bytes())
 
 
 def entries(f: ftplib.FTP, path: str) -> list[tuple[str, dict]]:
@@ -720,6 +746,235 @@ def ps5_send_payload(path: str, log_seconds: float = 0) -> str:
         time.sleep(log_seconds)
         text += "\n" + ("\n".join(klog.read(start)[-400:]) or "(nothing logged)")
     return text
+
+
+# ---- titles ----
+
+_titlectl_lock = threading.Lock()
+_names: dict[str, str] = {}
+
+
+def titlectl(action: str, argument: str = "", timeout: float = 10) -> str:
+    """Runs titlectl on the console and returns its report (the kernel log line after "ps5-mcp:titlectl: ").
+
+    titlectl is one prebuilt payload: its arguments are written into a slot in the ELF before it is sent, so any
+    title can be named without a compiler on the PC. elfldr reports nothing back, so the payload logs its result.
+    """
+    if not TITLECTL_ELF.exists():
+        raise RuntimeError(f"there is no {TITLECTL_ELF} (download it from the releases page, or build it: "
+                           "payload/titlectl/build.sh)")
+    elf = TITLECTL_ELF.read_bytes()
+    at = elf.find(TITLECTL_MARKER + b"\0")
+    if at < 0:
+        raise RuntimeError(f"{TITLECTL_ELF} has no argument slot; rebuild it")
+    args = action.encode() + b"\0" + argument.encode() + b"\0"
+    if len(args) > TITLECTL_ROOM:
+        raise ValueError(f"the argument is too long ({len(args)} bytes, at most {TITLECTL_ROOM})")
+    at += len(TITLECTL_MARKER) + 1
+    elf = elf[:at] + args + elf[at + len(args):]
+
+    klog.start()
+    if not klog.connected.wait(5):
+        raise RuntimeError(f"titlectl reports through the kernel log, and klogsrv (port {KLOG_PORT}) does not answer")
+    with _titlectl_lock:
+        start = time.time()
+        send_elf(elf)
+        while time.time() < start + timeout:
+            for line in klog.read(start, "ps5-mcp:titlectl: "):
+                report = line.split("ps5-mcp:titlectl: ", 1)[1].strip()
+                if report.startswith((action, "bad-args")):
+                    return report
+            time.sleep(0.1)
+    raise RuntimeError(f"titlectl did not report within {timeout:.0f} s (is elfldr on port {ELFLDR_PORT} running?)")
+
+
+def report_code(report: str) -> int:
+    """The rc=0x... of a titlectl report as a signed 32-bit number."""
+    m = re.search(r"rc=0x([0-9a-f]+)", report)
+    if not m:
+        raise RuntimeError(f"unexpected titlectl report: {report}")
+    value = int(m.group(1), 16)
+    return value - (1 << 32) if value >= 1 << 31 else value
+
+
+def check_title_id(title_id: str) -> str:
+    title_id = title_id.strip().upper()
+    if not TITLE_ID.match(title_id):
+        raise ValueError(f"'{title_id}' is not a title id (four letters and five digits, e.g. PPSA01234)")
+    return title_id
+
+
+def title_name(f: ftplib.FTP, title_id: str) -> str:
+    """The title's name from its param.json (the app metadata, else the app's own sce_sys), or ''."""
+    if title_id not in _names:
+        name = ""
+        for path in (f"/user/appmeta/{title_id}/param.json", f"/user/app/{title_id}/sce_sys/param.json"):
+            data = bytearray()
+            try:
+                f.retrbinary("RETR " + path, data.extend)
+                param = json.loads(data.decode("utf-8", "replace").rstrip("\0"))
+            except (ftplib.error_perm, ValueError):
+                continue
+            local = param.get("localizedParameters", {})
+            name = local.get(local.get("defaultLanguage", "en-US"), {}).get("titleName", "").strip()
+            if name:
+                break
+        _names[title_id] = name
+    return _names[title_id]
+
+
+def running_title() -> tuple[str, int] | None:
+    """(title id, app id) of the app in front, or None on the home screen."""
+    report = titlectl("running")
+    m = re.match(r"running (\S+) app_id=0x([0-9a-f]+)", report)
+    return (m.group(1), int(m.group(2), 16)) if m else None
+
+
+@mcp.tool()
+def ps5_titles(contains: str = "") -> str:
+    """List the installed titles (games, apps, homebrew registered by ShadowMountPlus) with their names.
+    contains: keep only titles whose id or name contains this (case-insensitive)."""
+    with ftp() as f:
+        ids = sorted(n for n, facts in entries(f, "/user/app") if facts["type"] == "dir")
+        rows = [(tid, title_name(f, tid)) for tid in ids]
+    if contains:
+        rows = [(tid, name) for tid, name in rows if contains.lower() in f"{tid} {name}".lower()]
+    return "\n".join(f"{tid}  {name or '(no name)'}" for tid, name in rows) or "no titles found"
+
+
+@mcp.tool()
+def ps5_running() -> str:
+    """Which app is in front on the console (its title id and name), or that the home screen is."""
+    current = running_title()
+    if not current:
+        return "no app is running in front (home screen)"
+    with ftp() as f:
+        name = title_name(f, current[0])
+    return " ".join(filter(None, (current[0], name, f"(app id 0x{current[1]:x})")))
+
+
+@mcp.tool()
+def ps5_launch(title_id: str) -> str:
+    """Start a title for the user in front of the console, e.g. "PPSA01234" (see ps5_titles). Homebrew must be
+    registered first (by ShadowMountPlus; see ps5_rescan). The title comes up after a few seconds; check with
+    ps5_running or a screenshot."""
+    title_id = check_title_id(title_id)
+    rc = report_code(titlectl("launch", title_id))
+    if rc < 0:
+        raise RuntimeError(f"the console did not start {title_id}: error 0x{rc & 0xFFFFFFFF:08x} (is it installed? "
+                           "ps5_titles lists what is). The console may show an error dialog; cross dismisses it")
+    return f"started {title_id} (app id 0x{rc:x})"
+
+
+@mcp.tool()
+def ps5_close(title_id: str, quit_file: str = "", timeout_s: float = 30) -> str:
+    """Close a title, the way the system's own "Close App" does. Only that title is closed: when another one is
+    in front, nothing happens.
+
+    quit_file: for an app of your own that ends itself when a file appears (e.g. /data/PS5SD/quit), the file to
+      write instead. Prefer that for apps that render with the GPU, which should leave on their own terms. The
+      tool waits until the app took the file and is gone, up to timeout_s.
+    """
+    title_id = check_title_id(title_id)
+    if not quit_file:
+        report = titlectl("close", title_id)
+        if "not-running" in report:
+            return f"{title_id} is not running"
+        rc = report_code(report)
+        if rc != 0:
+            raise RuntimeError(f"the console did not close {title_id}: error 0x{rc & 0xFFFFFFFF:08x}")
+        return f"closed {title_id}"
+
+    end = time.time() + timeout_s
+    with ftp() as f:
+        f.storbinary("STOR " + quit_file, BytesIO(b"quit\n"))
+        while time.time() < end and _remote_kind(f, quit_file) == "file":
+            time.sleep(1)
+        if _remote_kind(f, quit_file) == "file":
+            try:
+                f.delete(quit_file)
+            except ftplib.error_perm:
+                pass
+            raise RuntimeError(f"{title_id} did not take {quit_file} within {timeout_s:.0f} s (is it running, and does "
+                               "it watch that file?); removed the file again")
+    while time.time() < end:
+        current = running_title()
+        if not current or current[0] != title_id:
+            return f"{title_id} took {quit_file} and has closed"
+        time.sleep(1)
+    return f"{title_id} took {quit_file} but is still running after {timeout_s:.0f} s"
+
+
+@mcp.tool()
+def ps5_open_url(url: str) -> str:
+    """Open the console's web browser at url (http or https). It opens as a card over the running app, which keeps
+    running. Move the cursor with the left stick, click with cross, scroll with the right stick; close the card
+    with Options (hold it ~300 ms), then "Close Card"."""
+    if not re.match(r"^https?://\S+$", url):
+        raise ValueError("url must start with http:// or https://")
+    rc = report_code(titlectl("url", url))
+    if rc != 0:
+        raise RuntimeError(f"the console did not open the browser: error 0x{rc & 0xFFFFFFFF:08x}")
+    return f"opened {url}"
+
+
+@mcp.tool()
+def ps5_rescan() -> str:
+    """Ask ShadowMountPlus to scan for homebrew again, so an app uploaded to /data/homebrew/<title id> gets
+    registered (and then shows in ps5_titles and can be launched). Needs ShadowMountPlus with its API on port
+    10101. ShadowMountPlus may defer the scan while a homebrew app is running or suspended; the answer says so."""
+    request = urllib.request.Request(f"http://{IP}:{SMP_PORT}/api/v1/scan",
+                                     data=json.dumps({"reset_attempts": True}).encode(),
+                                     headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            result = json.load(response)
+    except OSError as e:
+        raise RuntimeError(f"ShadowMountPlus's API (port {SMP_PORT}) does not answer: {e}") from None
+    text = json.dumps(result)
+    # The flag may sit in a nested object.
+    if '"scan_deferred": true' in text:
+        reason = re.search(r'"scan_deferred_reason": "([^"]*)"', text)
+        queued = '"scan_queued": true' in text or '"queued": true' in text
+        return (f"ShadowMountPlus deferred the scan{f' ({reason.group(1)})' if reason else ''}"
+                f"{', but queued it' if queued else ''}. It defers while a homebrew app is running or suspended: "
+                "close it (ps5_close) and scan again if the app does not show up\n" + text)
+    if result.get("status") != 0:
+        raise RuntimeError("ShadowMountPlus rejected the scan: " + text)
+    _names.clear()
+    return "scan started\n" + text
+
+
+@mcp.tool()
+def ps5_processes(contains: str = "") -> str:
+    """The console's process table: pid, parent, state (2 = running, 3 = sleeping), name, what it waits on, thread
+    name. Payloads sent through elfldr are named payload.elf (services like ftpsrv.elf keep their own name); one
+    that hangs in a loop shows state 2 and no wait channel, as RemoteEye itself does while it answers.
+    contains: keep only lines containing this. Needs RemoteEye v6."""
+    with _lock, eye.session():
+        if eye.tag < PS_TAG:
+            eye.port = None
+            raise RuntimeError(f"the process list needs RemoteEye v{PS_TAG} or newer; the console runs v{eye.tag}")
+        rows = eye.lines("PS")
+    rows = [r[2:] for r in rows if r.startswith("P ")]
+    if contains:
+        rows = [r for r in rows if contains.lower() in r.lower()]
+    return "pid ppid state name wait thread\n" + "\n".join(rows)
+
+
+@mcp.tool()
+def ps5_kill_payload(pid: int) -> str:
+    """End a payload that hangs (one named payload.elf in ps5_processes), e.g. to free the port it holds. Refuses
+    any other process and RemoteEye itself; close titles with ps5_close instead. Other tools you loaded (e.g.
+    ShadowMountPlus) can be payload.elf too: be sure of the pid. Needs RemoteEye v6."""
+    with _lock, eye.session():
+        if eye.tag < PS_TAG:
+            eye.port = None
+            raise RuntimeError(f"ending payloads needs RemoteEye v{PS_TAG} or newer; the console runs v{eye.tag}")
+        reply = eye.call(f"KILL {int(pid)}")
+    if not reply.startswith("OK"):
+        raise RuntimeError(reply)
+    return f"sent SIGKILL to {pid} ({reply})"
 
 
 # ---- files ----

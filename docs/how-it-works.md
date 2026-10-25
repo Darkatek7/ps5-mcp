@@ -24,6 +24,18 @@ Called from a payload process, these never return:
 They talk to system services over IPC, which apparently never answers a payload process. `libSceAvcap2`
 (live composited frames) loads and resolves but was not pursued for the same reason.
 
+That holds for SharpProspero payloads, which load the module themselves. A payload built with the C
+[ps5-payload-sdk](https://github.com/ps5-payload-dev/sdk), linked against `libSceSystemService` and
+`libSceUserService`, calls `sceSystemServiceLaunchApp` and friends and gets answers (see *Titles* below).
+
+## FW 13.40 and later
+
+SharpProspero's payload runtime finds its own process through the kernel's `allproc` list before anything
+else runs. Up to commit `5dfdb4b` it chose that address by major version only, so every 13.x firmware got
+13.00's `0x28C5E00`, while 13.40, 13.42 and 13.60 have it at `0x28C9E80`. There the walk found nothing and the
+payload stopped before its own code: sent to elfldr, it simply never started. RemoteEye is built with the fix
+(SvenGDK/SharpProspero#6).
+
 ## Reading the system's code
 
 System modules are mapped execute-only: reading their code from memory kills the process. Instead, ftpsrv's
@@ -74,6 +86,40 @@ rather than refusing them, so the 20 ports are probed in parallel.
 HDR screenshots hold 16-bit PQ (SMPTE ST 2084) values. The Windows Imaging Component turns them into a normal
 8-bit picture; elsewhere the server decodes them with `imagecodecs`, converts PQ to nits, takes 250 nits as
 white and applies the sRGB curve, which matches the WIC output to about one level on average.
+
+## Titles
+
+`titlectl` is a small C payload with one fixed argument area: a 1040-byte `volatile` array that starts with the
+marker `PS5MCP-ARGS-V1:`. Before sending it, the server writes `"<action>\0<argument>\0"` behind the marker
+and its NUL, so the one ELF can name any title without a compiler on the PC. elfldr reports nothing back, so
+titlectl writes its result to the kernel log as one `ps5-mcp:titlectl: ...` line, which the server reads from
+its klogsrv connection. A round trip takes 0.2–0.8 s.
+
+| Action | Calls | Report |
+|---|---|---|
+| `launch` | `sceUserServiceGetForegroundUser`, `sceSystemServiceLaunchApp(title id, args, {user})` | `launch <id> rc=0x...`: the new app id, negative on error |
+| `close` | `sceLncUtilGetAppIdOfRunningBigApp` + `sceLncUtilGetAppTitleId`, then `sceLncUtilKillApp`; for an app not in front `sceSystemServiceGetAppId` + `sceSystemServiceKillApp` | `close <id> rc=0x0`, or `not-running` |
+| `running` | `sceLncUtilGetAppIdOfRunningBigApp` + `sceLncUtilGetAppTitleId` | `running <id> app_id=0x...`, or `running none` |
+| `url` | `sceSystemServiceLaunchWebBrowser(url)` | `url rc=0x0` |
+
+`close` only acts on the named title, and it goes through the system's own app lifecycle, as *Close App*
+does, rather than signalling the process. Homebrew that renders with the GPU should still rather end itself:
+an app that watches a quit file (`/data/<app>/quit`) gets it written by `ps5_close(quit_file=...)`, and the
+server waits until the file is gone and the app is no longer in front.
+
+The browser opens as a card over the running app, which keeps running. Its menu (Options, held briefly) has
+*Close Card*.
+
+Title names come from `/user/appmeta/<title id>/param.json` (`localizedParameters.<defaultLanguage>.titleName`),
+or the app's own `sce_sys/param.json`.
+
+## Processes
+
+A payload cannot be unloaded, and one that hangs keeps its port. RemoteEye v6 answers `PS` with the process
+table from `sysctl kern.proc.proc` (`struct kinfo_proc`, FreeBSD 11 layout: pid at 72, ppid 76, state 388,
+thread name 394, wait channel 411, command 447) and `KILL <pid>` with `kill(2)`. KILL refuses everything not
+named `payload.elf` — the name elfldr gives each payload — and RemoteEye's own pid, so no title or system
+process can be hit.
 
 ## The log
 

@@ -30,6 +30,8 @@
 //   BLOCK <hex>                        feed a whole state block, up to 0xA8 bytes in hex (the rest is
 //                                      zero); for fields STATE does not set, such as touch points
 //   DETACH                             remove the controller
+//   PS                                 the process table (Processes.cs)
+//   KILL <pid> [signal]                end a hung payload (only payload.elf, never RemoteEye; signal 9)
 
 using System;
 using System.Runtime.InteropServices;
@@ -44,7 +46,7 @@ internal static unsafe class Program
     // keeps receiving, so each build listens on PortBase + BuildTag. Raise BuildTag on each rebuild; the
     // PC scans the range for the newest.
     private const ushort PortBase = 3320;
-    private const int BuildTag = 4;
+    private const int BuildTag = 6;
     private const int MaxLine = 512;
 
     private const int SysIoctl = 54;
@@ -109,6 +111,10 @@ internal static unsafe class Program
                 ServeBlock(client, line + 6);
             else if (StartsWith(line, "DETACH"))
                 ServeDetach(client);
+            else if (StartsWith(line, "PS"))
+                Processes.ServeList(client);
+            else if (StartsWith(line, "KILL "))
+                ServeKill(client, line + 5);
             else
                 Send(client, "ERR unknown\n"u8);
         }
@@ -254,6 +260,15 @@ internal static unsafe class Program
         Send(client, "\n"u8);
     }
 
+    private static void ServeKill(int client, byte* args)
+    {
+        while (*args == (byte)' ') args++;
+        int pid = ParseInt(args);
+        while (*args >= (byte)'0' && *args <= (byte)'9') args++;
+        int signal = ParseInt(args);
+        Processes.ServeKill(client, pid, signal < 0 ? 9 : signal);
+    }
+
     private static long Ioctl(ulong request, void* arg)
         => PayloadCrt.Syscall(SysIoctl, HidFd, (long)request, (long)(nint)arg);
 
@@ -279,9 +294,9 @@ internal static unsafe class Program
         return count;
     }
 
-    private static void Send(int client, ReadOnlySpan<byte> data) => PayloadTcpServer.SendAll(client, data);
+    internal static void Send(int client, ReadOnlySpan<byte> data) => PayloadTcpServer.SendAll(client, data);
 
-    private static void SendInt(int client, int value)
+    internal static void SendInt(int client, int value)
     {
         byte* digits = stackalloc byte[12];
         int count = 0;
