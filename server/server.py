@@ -1184,8 +1184,7 @@ def ps5_wake(timeout_s: float = 60) -> str:
                            "console is on (or set PS5_REGIST_KEY). Until then, wake it with the controller or "
                            "HDMI-CEC")
     credential = wake_credential(key)
-    before = power_state()
-    if before == "on":
+    if power_state() == "on":
         return "the console is already on"
     message = ddp("WAKEUP", {"user-credential": credential, "client-type": "vr", "auth-type": "R",
                              "model": "w", "app-type": "r"})
@@ -1200,13 +1199,10 @@ def ps5_wake(timeout_s: float = 60) -> str:
             except OSError:
                 pass
         time.sleep(1)
-    if before is None:
-        raise RuntimeError(f"the console did not wake within {timeout_s:.0f} s, and it did not answer on the network "
-                           "before either: in rest mode it keeps the network only with Stay Connected to the "
-                           "Internet and Enable Turning On PS5 from Network (Settings > System > Power Saving > "
-                           "Features Available in Rest Mode)")
-    raise RuntimeError(f"the console did not wake within {timeout_s:.0f} s (is the RegistKey from this console, "
-                       "and is Enable Turning On PS5 from Network on?)")
+    raise RuntimeError(f"the console did not wake within {timeout_s:.0f} s. In rest mode it listens for the wake "
+                       "message only with Stay Connected to the Internet and Enable Turning On PS5 from Network "
+                       "(Settings > System > Power Saving > Features Available in Rest Mode); is the RegistKey "
+                       "from this console?")
 
 
 @mcp.tool()

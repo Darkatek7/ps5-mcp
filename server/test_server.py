@@ -724,7 +724,7 @@ class Power(unittest.TestCase):
     def test_wake_with_wrong_key(self):
         srv.REGIST_KEY = b"99999999".hex()
         ddp_server.state = "rest"
-        with self.assertRaisesRegex(RuntimeError, "is the RegistKey from this console"):
+        with self.assertRaisesRegex(RuntimeError, "did not wake"):
             srv.ps5_wake(timeout_s=2)
 
     def test_wake_when_the_network_sleeps(self):

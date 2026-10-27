@@ -123,8 +123,10 @@ or the app's own `sce_sys/param.json`.
 The power state comes from Remote Play's discovery protocol (DDP, UDP 9302): a `SRCH * HTTP/1.1` message is
 answered with `HTTP/1.1 200 Ok` when the console is on and `620 Server Standby` in rest mode, without any key.
 `ps5_rest` waits for the 620. The payloads keep running in rest mode; elfldr, ftpsrv and klogsrv even accept
-connections right after the console went to rest. Unless *Stay Connected to the Internet* is on, the network
-goes down some seconds later and nothing answers, DDP included.
+connections right after the console went to rest. Later it sometimes answers nothing, DDP included (seen
+15 s after going to rest, while another time it still answered after 60 s), also with *Stay Connected to the
+Internet* on; with that and *Enable Turning On PS5 from Network* it still takes the wake message (on 13.00: on
+again 11–13 s after it).
 
 `ps5_wake` sends `WAKEUP * HTTP/1.1` with `user-credential:` set to the registration's RegistKey (hex-decoded
 twice, read as one big-endian number, as pyremoteplay does), then waits for 200 and for elfldr to accept a
