@@ -23,11 +23,18 @@ Configuration (environment):
   PS5_SAVE_DIR    keep the original (full resolution) file of every screenshot in this folder
   PS5_ELFLDR_PORT / PS5_KLOG_PORT / PS5_REMOTEEYE_PORTS  other ports (default 9021 / 3232 / 3321-3340)
   PS5_SMP_PORT    ShadowMountPlus API port (default 10101)
+  PS5_REGIST_KEY  RegistKey of a Remote Play registration of the console, for ps5_wake; default: the one
+                  ps5_pair saved
+  PS5_REGIST_FILE where ps5_pair saves it (default ~/.ps5-mcp/regist.json)
+  PS5_DDP_PORT    Remote Play discovery port (default 9302), for ps5_wake and the power state
 """
 
 from __future__ import annotations
 
+import base64
 import ftplib
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -67,6 +74,12 @@ TITLECTL_ELF = Path(os.environ["PS5_TITLECTL_ELF"]) if os.environ.get("PS5_TITLE
     (p for p in (REPO / "payload" / "titlectl" / "out" / "titlectl.elf", REPO / "titlectl.elf") if p.exists()),
     REPO / "titlectl.elf")
 SMP_PORT = int(os.environ.get("PS5_SMP_PORT", "10101"))
+DDP_PORT = int(os.environ.get("PS5_DDP_PORT", "9302"))
+DDP_VERSION = "00030010"
+REGIST_KEY = os.environ.get("PS5_REGIST_KEY", "")
+REGIST_FILE = Path(os.environ.get("PS5_REGIST_FILE") or Path.home() / ".ps5-mcp" / "regist.json")
+POWER_CHECK_S = 3
+KLOG_QUIET_S = 60
 JXR2PNG = Path(__file__).with_name("jxr2png.ps1")
 GALLERY = "/user/av_contents/photo"
 THUMBNAILS = "/user/av_contents/thumbnails/photo"
@@ -283,7 +296,13 @@ class KlogTail:
     """Reads klogsrv in the background, so the log can be looked at after something happened.
 
     klogsrv sends every line to every connected client (checked on a console), so holding this connection
-    takes nothing away from other log readers.
+    takes nothing away from other log readers. A connection that was open when the console went to or came
+    back from rest mode stays open but gets no more lines (seen on 13.00), so the reader connects again when the
+    power state differs from the one at connecting: it looks every POWER_CHECK_S, and ready() looks before a call.
+
+    klogsrv itself can also go silent while clients stay connected (seen on 13.00, also without rest mode). It
+    opens /dev/klog again only after every client has left, so ready() also connects again after KLOG_QUIET_S
+    without a line, and titlectl() does when a payload ran without a single line being logged.
     """
 
     def __init__(self, keep: int = 20000) -> None:
@@ -292,23 +311,53 @@ class KlogTail:
         self.since: float | None = None
         self.connected = threading.Event()
         self.thread: threading.Thread | None = None
+        self.sock: socket.socket | None = None
+        self.power: str | None = None
+        self.retry = threading.Event()
+        self.last = 0.0
 
     def start(self) -> None:
         if self.thread is None:
             self.thread = threading.Thread(target=self._run, name="klog", daemon=True)
             self.thread.start()
 
+    def ready(self, timeout: float = 5) -> bool:
+        """Starts the reader, connects again if the console rested or woke since it connected or the log has been
+        quiet for KLOG_QUIET_S, and waits until it is connected."""
+        self.start()
+        if self.connected.wait(timeout):
+            power = power_state()
+            if (power is None or power == self.power) and time.time() < self.last + KLOG_QUIET_S:
+                return True
+            self.reconnect()
+        return self.connected.wait(timeout)
+
+    def reconnect(self) -> None:
+        self.connected.clear()
+        self.retry.set()
+
     def _run(self) -> None:
         while True:
             try:
                 with socket.create_connection((IP, KLOG_PORT), timeout=5) as s:
                     s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-                    s.settimeout(30)
+                    # Short, so a request to connect again is seen soon: another thread's shutdown() does not
+                    # end a waiting recv() on Windows.
+                    s.settimeout(1)
                     if self.since is None:
                         self.since = time.time()
+                    self.retry.clear()
+                    self.sock, self.power, self.last = s, power_state(), time.time()
                     self.connected.set()
                     rest = b""
-                    while True:
+                    check = time.time() + POWER_CHECK_S
+                    while not self.retry.is_set():
+                        if time.time() >= check:
+                            # Rest and wake can both happen between two tool calls, so look on our own.
+                            check = time.time() + POWER_CHECK_S
+                            power = power_state()
+                            if power is not None and power != self.power:
+                                self.retry.set()
                         try:
                             chunk = s.recv(65536)
                         except socket.timeout:
@@ -316,13 +365,15 @@ class KlogTail:
                         if not chunk:
                             break
                         *done, rest = (rest + chunk).split(b"\n")
-                        now = time.time()
+                        now = self.last = time.time()
                         with self.guard:
                             self.lines.extend((now, line.decode("latin1").rstrip("\r")) for line in done)
             except OSError:
                 pass
+            self.sock = None
             self.connected.clear()
-            time.sleep(3)
+            self.retry.wait(3)
+            self.retry.clear()
 
     def read(self, since: float, contains: str = "") -> list[str]:
         with self.guard:
@@ -743,8 +794,7 @@ def ps5_klog(seconds: float = 3, filter: str = "", since_s: float = 0) -> str:
     shows what led up to it. Payloads log with the 'sp:' prefix, and app crashes show up as coredump lines.
     """
     start = time.time()
-    klog.start()
-    if not klog.connected.wait(5):
+    if not klog.ready():
         raise RuntimeError(f"klogsrv (port {KLOG_PORT}) does not answer")
     time.sleep(max(0.0, seconds))
     lines = klog.read(start - since_s, filter)
@@ -761,8 +811,7 @@ def ps5_send_payload(path: str, log_seconds: float = 0) -> str:
     crashes)."""
     p = Path(path).resolve()
     if log_seconds:
-        klog.start()
-        klog.connected.wait(5)
+        klog.ready()
     start = time.time()
     send_elf(p)
     # It may be a newer RemoteEye: look for the newest instance again on the next call.
@@ -799,8 +848,7 @@ def titlectl(action: str, argument: str = "", timeout: float = 10) -> str:
     at += len(TITLECTL_MARKER) + 1
     elf = elf[:at] + args + elf[at + len(args):]
 
-    klog.start()
-    if not klog.connected.wait(5):
+    if not klog.ready():
         raise RuntimeError(f"titlectl reports through the kernel log, and klogsrv (port {KLOG_PORT}) does not answer")
     with _titlectl_lock:
         start = time.time()
@@ -811,6 +859,13 @@ def titlectl(action: str, argument: str = "", timeout: float = 10) -> str:
                 if report.startswith((action, "bad-args")):
                     return report
             time.sleep(0.1)
+        if not klog.read(start):
+            # Not even the kernel's line about the payload ending came: klogsrv has gone silent.
+            klog.reconnect()
+            raise RuntimeError(f"klogsrv sent nothing for {timeout:.0f} s, so titlectl's answer was lost (it may "
+                               "still have acted). The log reader connected again; try once more. If it stays "
+                               "silent, close every other klogsrv client (other ps5-mcp servers): klogsrv only "
+                               "reopens the kernel log once no client is connected")
     raise RuntimeError(f"titlectl did not report within {timeout:.0f} s (is elfldr on port {ELFLDR_PORT} running?)")
 
 
@@ -942,6 +997,202 @@ def ps5_open_url(url: str) -> str:
     if rc != 0:
         raise RuntimeError(f"the console did not open the browser: error 0x{rc & 0xFFFFFFFF:08x}")
     return f"opened {url}"
+
+
+# ---- power ----
+
+def ddp(msg_type: str, fields: dict[str, str] | None = None) -> bytes:
+    """A message of Remote Play's discovery protocol, as pyremoteplay's ddp.py builds it."""
+    lines = [f"{msg_type} * HTTP/1.1"] + [f"{k}:{v}" for k, v in (fields or {}).items()]
+    return ("\n".join(lines) + f"\ndevice-discovery-protocol-version:{DDP_VERSION}\n").encode()
+
+
+def power_state(timeout: float = 1) -> str | None:
+    """"on", "rest" or None (no answer: off, or not on the network) from a discovery search, which needs no key."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.settimeout(timeout)
+        try:
+            s.sendto(ddp("SRCH"), (IP, DDP_PORT))
+            reply = s.recvfrom(4096)[0].decode("latin1")
+        except OSError:
+            return None
+    status = reply.split("\n", 1)[0].split()
+    if len(status) >= 2 and status[1] == "200":
+        return "on"
+    if len(status) >= 2 and status[1] == "620":
+        return "rest"
+    return None
+
+
+def wake_credential(key: str) -> str:
+    """The user credential of a wake message from the RegistKey a Remote Play registration stores: hex of an ASCII
+    hex string, as pyremoteplay keeps it (its format_regist_key)."""
+    try:
+        return str(int.from_bytes(bytes.fromhex(bytes.fromhex(key.strip()).decode("ascii")), "big"))
+    except ValueError:
+        raise ValueError("the RegistKey is not hex (16 digits, as the console sends it and pyremoteplay stores it)"
+                         ) from None
+
+
+# Remote Play registration, ported from pyremoteplay's register.py and crypt.py (ktnrg45, GPL-3.0): the PIN and a
+# random nonce make an AES-CFB key and IV, the request carries the account id encrypted with them, and the
+# console's answer (encrypted the same way) holds the RegistKey. The constants are the PS5 bytes of its keys.py.
+RP_PORT = 9295
+RP_CLIENT_TYPE = "dabfa2ec873de5839bee8d3f4c0239c4282c07c25c6077a2931afcf0adc0d34f"
+RP_REG_KEY_0 = bytes.fromhex("d860e146bdb0bd94b460070bb14fe723")
+RP_REG_KEY_1 = bytes.fromhex("a83761b527fc076e62433aa701958a85")
+RP_HMAC_KEY = bytes.fromhex("464687b349ca8ce859c5270f5d7a69d6")
+
+
+def _rp_cipher(key: bytes, nonce: bytes, encrypt: bool):
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
+    try:
+        from cryptography.hazmat.decrepit.ciphers.modes import CFB
+    except ImportError:
+        from cryptography.hazmat.primitives.ciphers.modes import CFB
+
+    iv = hmac.new(RP_HMAC_KEY, nonce + bytes(8), hashlib.sha256).digest()[:16]
+    cipher = Cipher(algorithms.AES(key), CFB(iv))
+    return cipher.encryptor() if encrypt else cipher.decryptor()
+
+
+def rp_register(account_id: int, pin: str, timeout: float = 5) -> dict[str, str]:
+    """Registers this PC for Remote Play with the console, which must be showing (or have generated) pin, and
+    returns the console's answer, e.g. {"PS5-RegistKey": ..., "PS5-Mac": ..., "RP-Key": ...}."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.settimeout(timeout)
+        s.sendto(b"SRC3", (IP, RP_PORT))
+        try:
+            ready = s.recv(32)
+        except OSError:
+            ready = b""
+    if not ready.startswith(b"RES3"):
+        raise RuntimeError("the console is not waiting for a Remote Play device (no RES3 on port 9295)")
+
+    nonce = os.urandom(16)
+    key_0 = bytearray(RP_REG_KEY_0)
+    for i, byte in enumerate(int(pin).to_bytes(4, "big")):
+        key_0[12 + i] ^= byte
+    key_1 = bytes(((nonce[i] ^ RP_REG_KEY_1[i]) - 45 + i) % 256 for i in range(16))
+    filler = b"A" * 480
+    body = filler[:199] + key_1[8:] + filler[207:401] + key_1[:8] + filler[409:]
+    account = base64.b64encode(account_id.to_bytes(8, "little")).decode()
+    body += _rp_cipher(bytes(key_0), nonce, True).update(
+        f"Client-Type: {RP_CLIENT_TYPE}\r\nNp-AccountId: {account}\r\n".encode())
+    # The console expects this exact (malformed) request line.
+    head = ("POST /sie/ps5/rp/sess/rgst HTTP/1.1\r\n HTTP/1.1\r\nHOST: 10.0.2.15\r\n"
+            "User-Agent: remoteplay Windows\r\nConnection: close\r\n"
+            f"Content-Length: {len(body)}\r\nRP-Version: 1.0\r\n\r\n").encode()
+    with socket.create_connection((IP, RP_PORT), timeout=timeout) as s:
+        s.sendall(head + body)
+        answer = b""
+        try:
+            while chunk := s.recv(4096):
+                answer += chunk
+        except socket.timeout:
+            pass
+    status, _, rest = answer.partition(b"\r\n")
+    if status.split()[1:2] != [b"200"]:
+        raise RuntimeError(f"the console refused the registration: {status.decode('latin1') or 'no answer'} "
+                           "(a wrong PIN or account id)")
+    encrypted = rest.partition(b"\r\n\r\n")[2]
+    text = _rp_cipher(bytes(key_0), nonce, False).update(encrypted).decode("latin1")
+    return dict(line.split(": ", 1) for line in text.split("\r\n") if ": " in line)
+
+
+def saved_regist_key() -> str:
+    """The RegistKey for this console: PS5_REGIST_KEY, else the one ps5_pair saved."""
+    if REGIST_KEY:
+        return REGIST_KEY
+    try:
+        return json.loads(REGIST_FILE.read_text()).get(IP, {}).get("PS5-RegistKey", "")
+    except (OSError, ValueError):
+        return ""
+
+
+@mcp.tool()
+def ps5_pair(pin: str) -> str:
+    """Register this PC as a Remote Play device of the console (once), so ps5_wake can wake it. On the console,
+    open Settings > System > Remote Play > Link Device and pass the 8-digit PIN it shows. The user needs an
+    account id (signed in to PSN, or activated offline). The key is saved to PS5_REGIST_FILE (default
+    ~/.ps5-mcp/regist.json); PS5_REGIST_KEY, when set, is used instead."""
+    pin = re.sub(r"\s", "", pin)
+    if not re.fullmatch(r"\d{8}", pin):
+        raise ValueError("the PIN has 8 digits (Settings > System > Remote Play > Link Device)")
+    if power_state() == "rest":
+        raise RuntimeError("the console is in rest mode; wake it first")
+    # A PIN made by a payload is refused (REGIST_DEVICE_MISS): there the system sees no foreground user. So the
+    # PIN comes from the console's own screen, and titlectl only reads the account id.
+    report = titlectl("account", f"{user_id():x}")
+    m = re.match(r"account 0x([0-9a-f]+)", report)
+    if not m:
+        raise RuntimeError(f"user {user_id():x} has no account id: sign it in to PSN or activate it offline "
+                           "(OffAct), then restart the console")
+    info = rp_register(int(m.group(1), 16), pin)
+    key = info.get("PS5-RegistKey")
+    if not key:
+        raise RuntimeError(f"the console answered without a RegistKey: {sorted(info)}")
+    wake_credential(key)
+    saved = {}
+    try:
+        saved = json.loads(REGIST_FILE.read_text())
+    except (OSError, ValueError):
+        pass
+    saved[IP] = info
+    REGIST_FILE.parent.mkdir(parents=True, exist_ok=True)
+    REGIST_FILE.write_text(json.dumps(saved, indent=2))
+    return f"paired as Remote Play device of {info.get('PS5-Nickname', 'the console')}; key saved to {REGIST_FILE}"
+
+
+@mcp.tool()
+def ps5_rest() -> str:
+    """Put the console in rest mode, as its power menu does. The payloads (elfldr, ftpsrv, RemoteEye, ...) keep
+    running and answer again once it wakes. Wake it with ps5_wake (after ps5_pair once), the controller or the
+    TV over HDMI-CEC."""
+    try:
+        rc = report_code(titlectl("rest", timeout=5))
+        if rc != 0:
+            raise RuntimeError(f"the console did not go to rest: error 0x{rc & 0xFFFFFFFF:08x}")
+    except RuntimeError as e:
+        # The console may sleep before titlectl's line gets out; what counts is whether it rests.
+        if "did not report" not in str(e):
+            raise
+    end = time.time() + 20
+    while time.time() < end:
+        if power_state() == "rest":
+            return "the console is in rest mode"
+        time.sleep(1)
+    raise RuntimeError("the console did not report rest mode within 20 s")
+
+
+@mcp.tool()
+def ps5_wake(timeout_s: float = 60) -> str:
+    """Wake the console from rest mode over the network (Remote Play's wake message), and wait until elfldr
+    answers again. Needs a Remote Play registration (ps5_pair once, or PS5_REGIST_KEY) and *Settings > System >
+    Power Saving > Features Available in Rest Mode > Enable Turning On PS5 from Network*."""
+    key = saved_regist_key()
+    if not key:
+        raise RuntimeError("waking needs a Remote Play registration of this PC: run ps5_pair once while the "
+                           "console is on (or set PS5_REGIST_KEY). Until then, wake it with the controller or "
+                           "HDMI-CEC")
+    credential = wake_credential(key)
+    if power_state() == "on":
+        return "the console is already on"
+    message = ddp("WAKEUP", {"user-credential": credential, "client-type": "vr", "auth-type": "R",
+                             "model": "w", "app-type": "r"})
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.sendto(message, (IP, DDP_PORT))
+    start = time.time()
+    while time.time() < start + timeout_s:
+        if power_state() == "on":
+            try:
+                socket.create_connection((IP, ELFLDR_PORT), timeout=1).close()
+                return f"the console is on (after {time.time() - start:.0f} s)"
+            except OSError:
+                pass
+        time.sleep(1)
+    raise RuntimeError(f"the console did not wake within {timeout_s:.0f} s (is the RegistKey from this console, "
+                       "and is Enable Turning On PS5 from Network on?)")
 
 
 @mcp.tool()
@@ -1157,8 +1408,8 @@ def ps5_move(from_path: str, to_path: str) -> str:
 
 @mcp.tool()
 def ps5_status() -> str:
-    """Which console services answer, and the RemoteEye controller's state."""
-    lines = []
+    """Power state (on / rest mode), which console services answer, and the RemoteEye controller's state."""
+    lines = [f"power: {({'on': 'on', 'rest': 'rest mode'}).get(power_state(), 'no answer')}"]
     for name, port in (("elfldr", ELFLDR_PORT), ("ftpsrv", FTP_PORT), ("klogsrv", KLOG_PORT)):
         try:
             socket.create_connection((IP, port), timeout=1).close()

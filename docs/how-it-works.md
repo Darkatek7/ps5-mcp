@@ -101,6 +101,11 @@ its klogsrv connection. A round trip takes 0.2–0.8 s.
 | `close` | `sceLncUtilGetAppIdOfRunningBigApp` + `sceLncUtilGetAppTitleId`, then `sceLncUtilKillApp`; for an app not in front `sceSystemServiceGetAppId` + `sceSystemServiceKillApp` | `close <id> rc=0x0`, or `not-running` |
 | `running` | `sceLncUtilGetAppIdOfRunningBigApp` + `sceLncUtilGetAppTitleId` | `running <id> app_id=0x...`, or `running none` |
 | `url` | `sceSystemServiceLaunchWebBrowser(url)` | `url rc=0x0` |
+| `rest` | `sceSystemStateMgrEnterStandby()` | `rest rc=0x0` (may not get out before the console sleeps) |
+| `account <user id>` | `sceRegMgrGetInt`/`GetBin` on `USER_01_16_user_id` and `_account_id` (keys from linkdev's `regmgr.h`) | `account 0x...`, or `account none` |
+
+`account` takes the user id from the server: `sceUserServiceGetForegroundUser` answers `0xffffffff` inside a
+payload on 13.00, also with a user signed in, which matches every unused registry slot.
 
 `close` only acts on the named title, and it goes through the system's own app lifecycle, as *Close App*
 does, rather than signalling the process. Homebrew that renders with the GPU should still rather end itself:
@@ -112,6 +117,28 @@ The browser opens as a card over the running app, which keeps running. Its menu 
 
 Title names come from `/user/appmeta/<title id>/param.json` (`localizedParameters.<defaultLanguage>.titleName`),
 or the app's own `sce_sys/param.json`.
+
+## Power
+
+The power state comes from Remote Play's discovery protocol (DDP, UDP 9302): a `SRCH * HTTP/1.1` message is
+answered with `HTTP/1.1 200 Ok` when the console is on and `620 Server Standby` in rest mode, without any key.
+`ps5_rest` waits for the 620. The payloads keep running in rest mode; elfldr, ftpsrv and klogsrv even accept
+connections while the console rests.
+
+`ps5_wake` sends `WAKEUP * HTTP/1.1` with `user-credential:` set to the registration's RegistKey (hex-decoded
+twice, read as one big-endian number, as pyremoteplay does), then waits for 200 and for elfldr to accept a
+connection.
+
+`ps5_pair` is Remote Play's registration, ported from pyremoteplay (`register.py`, `crypt.py`) and checked
+against chiaki-ng's `regist.c`/`rpcrypt.c`: `SRC3` to UDP 9295 must be answered with `RES3` (the console only
+does that while a PIN is open), then an HTTP POST to `/sie/ps5/rp/sess/rgst` on TCP 9295. Its body is 480 filler
+bytes with a key derived from a random nonce hidden at offsets 199 and 401, followed by
+`Client-Type: …\r\nNp-AccountId: <base64 of the account id, little-endian>\r\n`, encrypted with AES-CFB-128;
+the key is a PS5 constant with the PIN XORed into its last four bytes, the IV the first 16 bytes of
+HMAC-SHA256(PS5 key, nonce ‖ counter). The answer is encrypted the same way and holds `PS5-RegistKey`.
+
+Registration errors the console logs for the PIN's owner (from ps5-remoteplay-get-pin): `0x80FC1040` wrong
+account id, `0x80FC1041` `REGIST_DEVICE_MISS`, `0x80FC1047` wrong PIN.
 
 ## Processes
 
@@ -126,6 +153,13 @@ process can be hit.
 klogsrv sends every kernel log line to every connected client, so the server keeps one connection open in the
 background and stamps each line with the time it arrived. `ps5_klog(since_s=...)` can then show what was logged
 before the call, and other log readers still get every line.
+
+klogsrv writes to each client in turn and opens `/dev/klog` only while it has clients; it opens it again only
+after the last one has left. On 13.00 it sometimes stops sending anything while clients stay connected (twice
+after rest mode, once without). Then every titlectl call times out, because its answer never arrives. The
+server therefore connects again when the power state changed since it connected (checked every 3 s), when the
+log has been quiet for 60 s before a call, and when a titlectl call saw no line at all. That only helps when it
+is klogsrv's last client: another ps5-mcp server or log reader that stays connected keeps it silent.
 
 Deleting the files afterwards over FTP leaves the gallery's database entry behind, shown as a blank tile in
 the Media Gallery, so that is opt-in.

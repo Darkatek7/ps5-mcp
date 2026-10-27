@@ -9,13 +9,18 @@
  *   close <title id>    close it, only if that title is the one running (the system's own close, not a signal)
  *   running             the title id of the running app, if any
  *   url <url>           open the web browser at url
+ *   rest                put the console in rest mode
+ *   account <user id>   the user's account id (signed in to PSN or activated offline), for Remote Play pairing
  *
  * Launch and close follow ps5-homebrew-dev-protocol's controllers (BlackBearReloaded, GPL-3.0-or-later), which
  * come from launch_app() in shsrv and sys_launch_title() in websrv by John Törnblom (GPL-3.0-or-later,
- * https://github.com/ps5-payload-dev). Opening the browser is the call PS5LM's open_browser makes.
+ * https://github.com/ps5-payload-dev). Opening the browser is the call PS5LM's open_browser makes. Rest mode is
+ * the call of shsrv's suspend bundle. The account lookup follows linkdev's pairui.c (John Törnblom,
+ * GPL-3.0-or-later).
  */
 
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <ps5/klog.h>
@@ -36,9 +41,16 @@ int sceLncUtilGetAppTitleId(uint32_t app_id, char *title_id);
 int sceLncUtilKillApp(uint32_t app_id);
 int sceSystemServiceGetAppId(const char *);
 int sceSystemServiceKillApp(int, int, int, int);
+int sceSystemStateMgrEnterStandby(void);
+int sceRegMgrGetInt(long, int *);
+int sceRegMgrGetBin(long, void *, int);
 
 #define MARKER "PS5MCP-ARGS-V1:"
 #define SLOT_SIZE 1040
+
+/* Registry keys of user slot n (1..16): USER_01_16_user_id and USER_01_16_account_id in linkdev's regmgr.h. */
+#define REG_USER_ID(n) (((n) - 1) * 65536L + 125829376L)
+#define REG_ACCOUNT_ID(n) (((n) - 1) * 65536L + 125830400L)
 
 /* Kept writable and volatile so the compiler neither drops it nor folds its contents into the code. */
 __attribute__((used)) static volatile char slot[SLOT_SIZE] = MARKER;
@@ -112,6 +124,45 @@ static int open_url(const char *url)
     return rc != 0;
 }
 
+static int rest(void)
+{
+    int rc = sceSystemStateMgrEnterStandby();
+
+    /* The system goes to rest a moment later, so this line usually still reaches klogsrv. */
+    klog_printf("ps5-mcp:titlectl: rest rc=0x%x\n", rc);
+    return rc != 0;
+}
+
+/* The account id (offline-activated or PSN) of user_id, or 0. */
+static uint64_t account_id(uint32_t user_id)
+{
+    uint64_t id = 0;
+    int i, uid;
+
+    for (i = 1; i <= 16; i++) {
+        uid = 0;
+        if (sceRegMgrGetInt(REG_USER_ID(i), &uid) != 0)
+            return 0;
+        if ((uint32_t)uid == user_id)
+            return sceRegMgrGetBin(REG_ACCOUNT_ID(i), &id, sizeof(id)) == 0 ? id : 0;
+    }
+    return 0;
+}
+
+/* The account id a Remote Play device registers with. user is the user id in hex, passed by the server:
+ * sceUserServiceGetForegroundUser gives 0xffffffff in a payload on 13.00, also with a user signed in. */
+static int report_account(const char *user)
+{
+    uint32_t user_id = (uint32_t)strtoul(user, 0, 16);
+    uint64_t id = user_id ? account_id(user_id) : 0;
+
+    if (id)
+        klog_printf("ps5-mcp:titlectl: account 0x%lx\n", id);
+    else
+        klog_printf("ps5-mcp:titlectl: account none user=0x%x\n", user_id);
+    return id == 0;
+}
+
 int main(void)
 {
     char args[SLOT_SIZE];
@@ -133,6 +184,10 @@ int main(void)
         return report_running();
     if (strcmp(action, "url") == 0 && *argument)
         return open_url(argument);
+    if (strcmp(action, "rest") == 0)
+        return rest();
+    if (strcmp(action, "account") == 0 && *argument)
+        return report_account(argument);
     klog_printf("ps5-mcp:titlectl: bad-args '%s'\n", action);
     return 2;
 }

@@ -1,4 +1,6 @@
 mcp>=1.2,<2
 Pillow>=10
+# Only for ps5_pair (Remote Play registration):
+cryptography>=3.4
 # Only for HDR (JPEG XR) screenshots outside Windows:
 # imagecodecs

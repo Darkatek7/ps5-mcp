@@ -6,10 +6,12 @@ Run with:  python -m unittest server/test_server.py
 
 from __future__ import annotations
 
+import base64
 import ftplib
 import importlib.util
 import json
 import os
+import re
 import socket
 import sys
 import tempfile
@@ -32,6 +34,8 @@ def listener() -> socket.socket:
 
 
 EYE, KLOG, ELFLDR = listener(), listener(), listener()
+DDP = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+DDP.bind(("127.0.0.1", 0))
 SMP_ANSWER: dict = {"status": 0}
 
 
@@ -62,6 +66,7 @@ os.environ.update({
     "PS5_KLOG_PORT": str(KLOG.getsockname()[1]),
     "PS5_ELFLDR_PORT": str(ELFLDR.getsockname()[1]),
     "PS5_SMP_PORT": str(SMP.server_address[1]),
+    "PS5_DDP_PORT": str(DDP.getsockname()[1]),
 })
 # Loaded by path: run from the repository root, "import server" would find the server/ folder instead.
 _spec = importlib.util.spec_from_file_location("ps5_server", Path(__file__).with_name("server.py"))
@@ -201,8 +206,11 @@ class FakeKlog(threading.Thread):
         end = time.time() + 5
         while not self.clients and time.time() < end:
             time.sleep(0.05)
-        for client in self.clients:
-            client.sendall(data)
+        for client in list(self.clients):
+            try:
+                client.sendall(data)
+            except OSError:  # a port check, as ps5_status makes
+                self.clients.remove(client)
 
 
 class FakeElfldr(threading.Thread):
@@ -213,15 +221,23 @@ class FakeElfldr(threading.Thread):
         self.installed = {"PPSA01234", "PPSA05678"}
         self.running: str | None = None
         self.received: list[tuple[str, str]] = []
+        self.silent = False  # klogsrv gone quiet: the payload runs, nothing reaches the log
 
     def run(self) -> None:
         while True:
             client, _ = ELFLDR.accept()
-            with client:
-                data = b"".join(iter(lambda: client.recv(65536), b""))
+            try:
+                with client:
+                    data = b"".join(iter(lambda: client.recv(65536), b""))
+            except OSError:
+                data = b""
+            if not data:  # a port check, as ps5_status and ps5_wake make
+                continue
             at = data.find(srv.TITLECTL_MARKER + b"\0") + len(srv.TITLECTL_MARKER) + 1
             action, argument = data[at:].split(b"\0")[:2]
             self.received.append((action.decode(), argument.decode()))
+            if self.silent:
+                continue
             klog_server.send(f"ps5-mcp:titlectl: {self.report(action.decode(), argument.decode())}\n".encode())
 
     def report(self, action: str, argument: str) -> str:
@@ -239,7 +255,33 @@ class FakeElfldr(threading.Thread):
             return f"close {argument} rc=0x0"
         if action == "url":
             return "url rc=0x0"
+        if action == "rest":
+            ddp_server.state = "rest"
+            return "rest rc=0x0"
+        if action == "account":
+            return "account 0x1122334455667788" if argument == "1ea2f4d9" else f"account none user=0x{argument}"
         return f"bad-args '{action}'"
+
+
+class FakeDDP(threading.Thread):
+    """Remote Play discovery: answers SRCH with the power state, and wakes on WAKEUP with the right credential."""
+
+    def __init__(self) -> None:
+        super().__init__(daemon=True)
+        self.state = "on"
+        self.credential = ""
+        self.received: list[str] = []
+
+    def run(self) -> None:
+        while True:
+            data, sender = DDP.recvfrom(4096)
+            message = data.decode()
+            self.received.append(message)
+            if message.startswith("SRCH ") and self.state:
+                status = "200 Ok" if self.state == "on" else "620 Server Standby"
+                DDP.sendto(f"HTTP/1.1 {status}\nhost-type:PS5\n".encode(), sender)
+            elif message.startswith("WAKEUP ") and f"user-credential:{self.credential}\n" in message:
+                self.state = "on"
 
 
 SHOT = f"{srv.GALLERY}/NPXS40087/NPXS40087/a1/shot.png"
@@ -249,6 +291,8 @@ klog_server = FakeKlog()
 klog_server.start()
 elfldr = FakeElfldr()
 elfldr.start()
+ddp_server = FakeDDP()
+ddp_server.start()
 srv.ftp = FakeFTP
 
 
@@ -509,6 +553,178 @@ class Titles(unittest.TestCase):
         SMP_ANSWER = {"status": 1}
         with self.assertRaisesRegex(RuntimeError, "rejected"):
             srv.ps5_rescan()
+
+
+class FakeRegistration(threading.Thread):
+    """The console's Remote Play registration on one port number, UDP and TCP: answers SRC3 while a PIN is
+    shown, and a registration with that PIN and the expected account id with an encrypted RegistKey."""
+
+    def __init__(self) -> None:
+        super().__init__(daemon=True)
+        self.tcp = listener()
+        self.port = self.tcp.getsockname()[1]
+        self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.udp.bind(("127.0.0.1", self.port))
+        self.pin: str | None = None
+        self.account = base64.b64encode((0x1122334455667788).to_bytes(8, "little")).decode()
+        threading.Thread(target=self.search, daemon=True).start()
+
+    def search(self) -> None:
+        while True:
+            data, sender = self.udp.recvfrom(64)
+            if data == b"SRC3" and self.pin:
+                self.udp.sendto(b"RES3", sender)
+
+    def run(self) -> None:
+        while True:
+            client, _ = self.tcp.accept()
+            with client:
+                data = b""
+                while b"\r\n\r\n" not in data:
+                    data += client.recv(4096)
+                head, _, body = data.partition(b"\r\n\r\n")
+                length = int(re.search(rb"Content-Length: (\d+)", head).group(1))
+                while len(body) < length:
+                    body += client.recv(4096)
+                client.sendall(self.answer(body))
+
+    def answer(self, body: bytes) -> bytes:
+        # Undo the nonce hiding (key 1 is the nonce mixed with RP_REG_KEY_1), as the console does.
+        key_1 = body[401:409] + body[199:207]
+        nonce = bytes((((key_1[i] + 45 - i) % 256) ^ srv.RP_REG_KEY_1[i]) for i in range(16))
+        key_0 = bytearray(srv.RP_REG_KEY_0)
+        for i, byte in enumerate(int(self.pin).to_bytes(4, "big")):
+            key_0[12 + i] ^= byte
+        inner = srv._rp_cipher(bytes(key_0), nonce, False).update(body[480:])
+        if f"Np-AccountId: {self.account}\r\n".encode() not in inner:
+            return b"HTTP/1.1 403 Forbidden\r\n\r\n"
+        reply = srv._rp_cipher(bytes(key_0), nonce, True).update(
+            b"PS5-Mac: B41F4D2FFF33\r\nPS5-RegistKey: " + b"0a1b2c3d".hex().encode()
+            + b"\r\nPS5-Nickname: PS5-054\r\n")
+        return b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(reply) + reply
+
+
+registration = FakeRegistration()
+registration.start()
+
+
+class Power(unittest.TestCase):
+    # A RegistKey as pyremoteplay stores it: hex of the ASCII hex string "0a1b2c3d".
+    KEY = b"0a1b2c3d".hex()
+
+    def setUp(self):
+        ddp_server.state = "on"
+        ddp_server.credential = str(0x0A1B2C3D)
+        ddp_server.received.clear()
+        elfldr.received.clear()
+        tmp = tempfile.NamedTemporaryFile(suffix=".elf", delete=False)
+        tmp.write(b"\x7fELF" + srv.TITLECTL_MARKER + b"\0" * 1025)
+        tmp.close()
+        self.addCleanup(os.unlink, tmp.name)
+        srv.TITLECTL_ELF = Path(tmp.name)
+        self.addCleanup(setattr, srv, "REGIST_KEY", srv.REGIST_KEY)
+        self.addCleanup(setattr, srv, "REGIST_FILE", srv.REGIST_FILE)
+        self.addCleanup(setattr, srv, "RP_PORT", srv.RP_PORT)
+        srv.REGIST_FILE = Path(tempfile.mkdtemp()) / "regist.json"
+        srv.RP_PORT = registration.port
+        registration.pin = None
+
+    def test_ddp_message(self):
+        self.assertEqual(srv.ddp("WAKEUP", {"user-credential": "1"}),
+                         b"WAKEUP * HTTP/1.1\nuser-credential:1\ndevice-discovery-protocol-version:00030010\n")
+
+    def test_wake_credential(self):
+        self.assertEqual(srv.wake_credential(self.KEY), str(0x0A1B2C3D))
+        with self.assertRaises(ValueError):
+            srv.wake_credential("not a key")
+
+    def test_power_state(self):
+        self.assertEqual(srv.power_state(), "on")
+        ddp_server.state = "rest"
+        self.assertEqual(srv.power_state(), "rest")
+        ddp_server.state = None
+        self.assertIsNone(srv.power_state(timeout=0.3))
+
+    def test_rest(self):
+        self.assertEqual(srv.ps5_rest(), "the console is in rest mode")
+        self.assertEqual(elfldr.received, [("rest", "")])
+        self.assertTrue(srv.ps5_status().startswith("power: rest mode\n"))
+
+    def test_klog_connects_again_after_rest(self):
+        self.assertTrue(srv.klog.ready())
+        before = srv.klog.sock
+        self.assertTrue(srv.klog.ready())
+        self.assertIs(srv.klog.sock, before)
+        ddp_server.state = "rest"
+        self.assertTrue(srv.klog.ready())
+        self.assertIsNot(srv.klog.sock, before)
+        self.assertEqual(srv.klog.power, "rest")
+        # Rested and woke between two calls: the reader sees it on its own.
+        before = srv.klog.sock
+        ddp_server.state = "on"
+        time.sleep(srv.POWER_CHECK_S + 2)
+        self.assertTrue(srv.klog.connected.is_set())
+        self.assertIsNot(srv.klog.sock, before)
+        self.assertEqual(srv.klog.power, "on")
+
+    def test_pair_saves_the_key_and_wake_uses_it(self):
+        srv.REGIST_KEY = ""
+        registration.pin = "13589201"
+        self.assertTrue(srv.ps5_pair("1358 9201").startswith("paired as Remote Play device of PS5-054"))
+        self.assertEqual(elfldr.received, [("account", "1ea2f4d9")])
+        saved = json.loads(srv.REGIST_FILE.read_text())
+        self.assertEqual(saved["127.0.0.1"]["PS5-RegistKey"], self.KEY)
+        ddp_server.state = "rest"
+        self.assertTrue(srv.ps5_wake(timeout_s=10).startswith("the console is on"))
+
+    def test_pair_errors(self):
+        with self.assertRaisesRegex(ValueError, "8 digits"):
+            srv.ps5_pair("1234")
+        with self.assertRaisesRegex(RuntimeError, "not waiting"):
+            srv.ps5_pair("13589201")
+        registration.pin = "13589201"
+        registration.account, account = "AAAAAAAAAAA=", registration.account
+        try:
+            with self.assertRaisesRegex(RuntimeError, "403"):
+                srv.ps5_pair("13589201")
+        finally:
+            registration.account = account
+        self.assertFalse(srv.REGIST_FILE.exists())
+
+    def test_klog_connects_again_when_klogsrv_goes_quiet(self):
+        self.assertTrue(srv.klog.ready())
+        before = srv.klog.sock
+        srv.klog.last = 0
+        self.assertTrue(srv.klog.ready())
+        self.assertIsNot(srv.klog.sock, before)
+        before = srv.klog.sock
+        elfldr.silent = True
+        try:
+            with self.assertRaisesRegex(RuntimeError, "klogsrv sent nothing"):
+                srv.titlectl("running", timeout=1)
+        finally:
+            elfldr.silent = False
+        self.assertTrue(srv.klog.ready())
+        self.assertIsNot(srv.klog.sock, before)
+
+    def test_wake_needs_key(self):
+        srv.REGIST_KEY = ""
+        ddp_server.state = "rest"
+        with self.assertRaisesRegex(RuntimeError, "PS5_REGIST_KEY"):
+            srv.ps5_wake()
+
+    def test_wake(self):
+        srv.REGIST_KEY = self.KEY
+        self.assertEqual(srv.ps5_wake(), "the console is already on")
+        ddp_server.state = "rest"
+        self.assertTrue(srv.ps5_wake(timeout_s=10).startswith("the console is on"))
+        self.assertTrue(any(m.startswith("WAKEUP ") for m in ddp_server.received))
+
+    def test_wake_with_wrong_key(self):
+        srv.REGIST_KEY = b"99999999".hex()
+        ddp_server.state = "rest"
+        with self.assertRaisesRegex(RuntimeError, "did not wake"):
+            srv.ps5_wake(timeout_s=2)
 
 
 if __name__ == "__main__":

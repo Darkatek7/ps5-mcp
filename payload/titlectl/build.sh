@@ -10,6 +10,6 @@ sdk=${PS5_PAYLOAD_SDK:-/opt/ps5-payload-sdk}
 
 mkdir -p "$here/out"
 "$sdk/bin/prospero-clang" -Wall -Werror -O2 -o "$here/out/titlectl.elf" "$here/titlectl.c" \
-    -lSceSystemService -lSceUserService
+    -lSceSystemService -lSceUserService -lSceRegMgr
 grep -q "PS5MCP-ARGS-V1:" "$here/out/titlectl.elf" || { echo "the argument slot is missing from the ELF" >&2; exit 1; }
 echo "built $here/out/titlectl.elf ($(wc -c < "$here/out/titlectl.elf") bytes)"
