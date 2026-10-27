@@ -123,15 +123,17 @@ or the app's own `sce_sys/param.json`.
 The power state comes from Remote Play's discovery protocol (DDP, UDP 9302): a `SRCH * HTTP/1.1` message is
 answered with `HTTP/1.1 200 Ok` when the console is on and `620 Server Standby` in rest mode, without any key.
 `ps5_rest` waits for the 620. The payloads keep running in rest mode; elfldr, ftpsrv and klogsrv even accept
-connections while the console rests.
+connections right after the console went to rest. Unless *Stay Connected to the Internet* is on, the network
+goes down some seconds later and nothing answers, DDP included.
 
 `ps5_wake` sends `WAKEUP * HTTP/1.1` with `user-credential:` set to the registration's RegistKey (hex-decoded
 twice, read as one big-endian number, as pyremoteplay does), then waits for 200 and for elfldr to accept a
 connection.
 
 `ps5_pair` is Remote Play's registration, ported from pyremoteplay (`register.py`, `crypt.py`) and checked
-against chiaki-ng's `regist.c`/`rpcrypt.c`: `SRC3` to UDP 9295 must be answered with `RES3` (the console only
-does that while a PIN is open), then an HTTP POST to `/sie/ps5/rp/sess/rgst` on TCP 9295. Its body is 480 filler
+against chiaki-ng's `regist.c`/`rpcrypt.c` (the request is byte for byte pyremoteplay's for the same nonce):
+`SRC3` to UDP 9295, sent **from UDP port 9303**, must be answered with `RES3` (the console only does that while
+a PIN is open), then an HTTP POST to `/sie/ps5/rp/sess/rgst` on TCP 9295. Its body is 480 filler
 bytes with a key derived from a random nonce hidden at offsets 199 and 401, followed by
 `Client-Type: …\r\nNp-AccountId: <base64 of the account id, little-endian>\r\n`, encrypted with AES-CFB-128;
 the key is a PS5 constant with the PIN XORed into its last four bytes, the IV the first 16 bytes of

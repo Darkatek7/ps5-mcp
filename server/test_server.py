@@ -280,7 +280,8 @@ class FakeDDP(threading.Thread):
             if message.startswith("SRCH ") and self.state:
                 status = "200 Ok" if self.state == "on" else "620 Server Standby"
                 DDP.sendto(f"HTTP/1.1 {status}\nhost-type:PS5\n".encode(), sender)
-            elif message.startswith("WAKEUP ") and f"user-credential:{self.credential}\n" in message:
+            elif (message.startswith("WAKEUP ") and self.state
+                  and f"user-credential:{self.credential}\n" in message):
                 self.state = "on"
 
 
@@ -723,7 +724,13 @@ class Power(unittest.TestCase):
     def test_wake_with_wrong_key(self):
         srv.REGIST_KEY = b"99999999".hex()
         ddp_server.state = "rest"
-        with self.assertRaisesRegex(RuntimeError, "did not wake"):
+        with self.assertRaisesRegex(RuntimeError, "is the RegistKey from this console"):
+            srv.ps5_wake(timeout_s=2)
+
+    def test_wake_when_the_network_sleeps(self):
+        srv.REGIST_KEY = self.KEY
+        ddp_server.state = None
+        with self.assertRaisesRegex(RuntimeError, "Stay Connected to the Internet"):
             srv.ps5_wake(timeout_s=2)
 
 

@@ -1038,6 +1038,7 @@ def wake_credential(key: str) -> str:
 # random nonce make an AES-CFB key and IV, the request carries the account id encrypted with them, and the
 # console's answer (encrypted the same way) holds the RegistKey. The constants are the PS5 bytes of its keys.py.
 RP_PORT = 9295
+RP_SEARCH_PORT = 9303
 RP_CLIENT_TYPE = "dabfa2ec873de5839bee8d3f4c0239c4282c07c25c6077a2931afcf0adc0d34f"
 RP_REG_KEY_0 = bytes.fromhex("d860e146bdb0bd94b460070bb14fe723")
 RP_REG_KEY_1 = bytes.fromhex("a83761b527fc076e62433aa701958a85")
@@ -1060,6 +1061,12 @@ def rp_register(account_id: int, pin: str, timeout: float = 5) -> dict[str, str]
     """Registers this PC for Remote Play with the console, which must be showing (or have generated) pin, and
     returns the console's answer, e.g. {"PS5-RegistKey": ..., "PS5-Mac": ..., "RP-Key": ...}."""
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        # From 9303, as pyremoteplay's const.py says the PS5 needs; the registration that worked on the test
+        # console came from there.
+        try:
+            s.bind(("", RP_SEARCH_PORT))
+        except OSError:
+            pass
         s.settimeout(timeout)
         s.sendto(b"SRC3", (IP, RP_PORT))
         try:
@@ -1168,15 +1175,17 @@ def ps5_rest() -> str:
 @mcp.tool()
 def ps5_wake(timeout_s: float = 60) -> str:
     """Wake the console from rest mode over the network (Remote Play's wake message), and wait until elfldr
-    answers again. Needs a Remote Play registration (ps5_pair once, or PS5_REGIST_KEY) and *Settings > System >
-    Power Saving > Features Available in Rest Mode > Enable Turning On PS5 from Network*."""
+    answers again. Needs a Remote Play registration (ps5_pair once, or PS5_REGIST_KEY), and in *Settings > System >
+    Power Saving > Features Available in Rest Mode* both Stay Connected to the Internet and Enable Turning On PS5
+    from Network."""
     key = saved_regist_key()
     if not key:
         raise RuntimeError("waking needs a Remote Play registration of this PC: run ps5_pair once while the "
                            "console is on (or set PS5_REGIST_KEY). Until then, wake it with the controller or "
                            "HDMI-CEC")
     credential = wake_credential(key)
-    if power_state() == "on":
+    before = power_state()
+    if before == "on":
         return "the console is already on"
     message = ddp("WAKEUP", {"user-credential": credential, "client-type": "vr", "auth-type": "R",
                              "model": "w", "app-type": "r"})
@@ -1191,6 +1200,11 @@ def ps5_wake(timeout_s: float = 60) -> str:
             except OSError:
                 pass
         time.sleep(1)
+    if before is None:
+        raise RuntimeError(f"the console did not wake within {timeout_s:.0f} s, and it did not answer on the network "
+                           "before either: in rest mode it keeps the network only with Stay Connected to the "
+                           "Internet and Enable Turning On PS5 from Network (Settings > System > Power Saving > "
+                           "Features Available in Rest Mode)")
     raise RuntimeError(f"the console did not wake within {timeout_s:.0f} s (is the RegistKey from this console, "
                        "and is Enable Turning On PS5 from Network on?)")
 
