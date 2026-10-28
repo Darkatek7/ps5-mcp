@@ -44,6 +44,7 @@ Claude ── MCP (stdio) ── server.py ──┬── TCP ── RemoteEye 
 | `ps5_close(title_id, quit_file, timeout_s)` | Close a title the way the system's *Close App* does; or, with `quit_file`, write the file an app of your own watches and wait until it has ended itself |
 | `ps5_open_url(url)` | Open the console's web browser at a URL (as a card over the running app) |
 | `ps5_rest()` | Put the console in rest mode; the payloads keep running |
+| `ps5_power_off(confirm)` | Turn the console off; **ends the jailbreak**, and `ps5_wake` cannot turn it on again. Only with `confirm=true` |
 | `ps5_wake(timeout_s)` | Wake it from rest mode over the network; needs a Remote Play registration (see [Rest mode and waking](#rest-mode-and-waking)) |
 | `ps5_pair(pin)` | Register this PC as a Remote Play device once, with the PIN from *Link Device*; saves the key for `ps5_wake` |
 | `ps5_rescan()` | Ask ShadowMountPlus to register newly uploaded homebrew (`/data/homebrew/<title id>`) |
@@ -126,7 +127,8 @@ clear them in the Media Gallery from time to time.
 
 `ps5_rest` puts the console in rest mode the way its power menu does (`titlectl` calls
 `sceSystemStateMgrEnterStandby`). The payloads keep running and answer again once it wakes, so the jailbreak
-stays. There is deliberately no power-off tool: that would end the jailbreak.
+stays. `ps5_power_off(confirm=true)` turns the console off (`sceSystemStateMgrTurnOff`); that ends the jailbreak,
+and only the power button or a controller turns it on again, so the tool refuses without `confirm=true`.
 
 `ps5_wake` sends Remote Play's wake message, which the console only accepts with the key of a Remote Play
 registration of this PC. Register once with `ps5_pair`: open *Settings → System → Remote Play → Link Device*

@@ -1156,20 +1156,52 @@ def ps5_rest() -> str:
     """Put the console in rest mode, as its power menu does. The payloads (elfldr, ftpsrv, RemoteEye, ...) keep
     running and answer again once it wakes. Wake it with ps5_wake (after ps5_pair once), the controller or the
     TV over HDMI-CEC."""
-    try:
-        rc = report_code(titlectl("rest", timeout=5))
-        if rc != 0:
-            raise RuntimeError(f"the console did not go to rest: error 0x{rc & 0xFFFFFFFF:08x}")
-    except RuntimeError as e:
-        # The console may sleep before titlectl's line gets out; what counts is whether it rests.
-        if "did not report" not in str(e):
-            raise
+    power_call("rest", "the console did not go to rest")
     end = time.time() + 20
     while time.time() < end:
         if power_state() == "rest":
             return "the console is in rest mode"
         time.sleep(1)
     raise RuntimeError("the console did not report rest mode within 20 s")
+
+
+def power_call(action: str, failed: str) -> None:
+    """Runs titlectl's rest or off. The console may stop before titlectl's line gets out, so a missing answer is
+    no error; the caller checks the power state instead."""
+    try:
+        rc = report_code(titlectl(action, timeout=5))
+    except RuntimeError as e:
+        if "did not report" in str(e) or "klogsrv sent nothing" in str(e):
+            return
+        raise
+    if rc != 0:
+        raise RuntimeError(f"{failed}: error 0x{rc & 0xFFFFFFFF:08x}")
+
+
+def elfldr_answers() -> bool:
+    try:
+        socket.create_connection((IP, ELFLDR_PORT), timeout=1).close()
+        return True
+    except OSError:
+        return False
+
+
+@mcp.tool()
+def ps5_power_off(confirm: bool = False) -> str:
+    """Turn the console off, as its power menu does. This ends the jailbreak: no payload runs until the exploit is
+    started again, and ps5_wake cannot turn it on (it only wakes from rest mode). Pass confirm=true only when the
+    user asked to turn the console off; ps5_rest keeps the jailbreak."""
+    if not confirm:
+        raise ValueError("turning off ends the jailbreak, and ps5_wake cannot turn the console on again. Call with "
+                         "confirm=true if the user wants that; ps5_rest keeps the jailbreak")
+    power_call("off", "the console did not turn off")
+    end = time.time() + 60
+    while time.time() < end:
+        if not elfldr_answers() and power_state() is None:
+            return ("the console is turning off. Start it with its power button or a controller, then the exploit "
+                    "again")
+        time.sleep(1)
+    raise RuntimeError("the console still answered 60 s after the call to turn off")
 
 
 @mcp.tool()
@@ -1192,12 +1224,8 @@ def ps5_wake(timeout_s: float = 60) -> str:
         s.sendto(message, (IP, DDP_PORT))
     start = time.time()
     while time.time() < start + timeout_s:
-        if power_state() == "on":
-            try:
-                socket.create_connection((IP, ELFLDR_PORT), timeout=1).close()
-                return f"the console is on (after {time.time() - start:.0f} s)"
-            except OSError:
-                pass
+        if power_state() == "on" and elfldr_answers():
+            return f"the console is on (after {time.time() - start:.0f} s)"
         time.sleep(1)
     raise RuntimeError(f"the console did not wake within {timeout_s:.0f} s. In rest mode it listens for the wake "
                        "message only with Stay Connected to the Internet and Enable Turning On PS5 from Network "

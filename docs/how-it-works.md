@@ -102,6 +102,7 @@ its klogsrv connection. A round trip takes 0.2–0.8 s.
 | `running` | `sceLncUtilGetAppIdOfRunningBigApp` + `sceLncUtilGetAppTitleId` | `running <id> app_id=0x...`, or `running none` |
 | `url` | `sceSystemServiceLaunchWebBrowser(url)` | `url rc=0x0` |
 | `rest` | `sceSystemStateMgrEnterStandby()` | `rest rc=0x0` (may not get out before the console sleeps) |
+| `off` | `sceSystemStateMgrTurnOff()` | `off rc=0x0` (likewise); `ps5_power_off` then waits until elfldr and DDP stop answering |
 | `account <user id>` | `sceRegMgrGetInt`/`GetBin` on `USER_01_16_user_id` and `_account_id` (keys from linkdev's `regmgr.h`) | `account 0x...`, or `account none` |
 
 `account` takes the user id from the server: `sceUserServiceGetForegroundUser` answers `0xffffffff` inside a

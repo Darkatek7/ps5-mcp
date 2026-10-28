@@ -10,13 +10,14 @@
  *   running             the title id of the running app, if any
  *   url <url>           open the web browser at url
  *   rest                put the console in rest mode
+ *   off                 turn the console off (ends the jailbreak)
  *   account <user id>   the user's account id (signed in to PSN or activated offline), for Remote Play pairing
  *
  * Launch and close follow ps5-homebrew-dev-protocol's controllers (BlackBearReloaded, GPL-3.0-or-later), which
  * come from launch_app() in shsrv and sys_launch_title() in websrv by John Törnblom (GPL-3.0-or-later,
  * https://github.com/ps5-payload-dev). Opening the browser is the call PS5LM's open_browser makes. Rest mode is
- * the call of shsrv's suspend bundle. The account lookup follows linkdev's pairui.c (John Törnblom,
- * GPL-3.0-or-later).
+ * the call of shsrv's suspend bundle, turning off the one ps5-homeassistant's power_off makes. The account lookup
+ * follows linkdev's pairui.c (John Törnblom, GPL-3.0-or-later).
  */
 
 #include <stdint.h>
@@ -42,6 +43,7 @@ int sceLncUtilKillApp(uint32_t app_id);
 int sceSystemServiceGetAppId(const char *);
 int sceSystemServiceKillApp(int, int, int, int);
 int sceSystemStateMgrEnterStandby(void);
+int sceSystemStateMgrTurnOff(void);
 int sceRegMgrGetInt(long, int *);
 int sceRegMgrGetBin(long, void *, int);
 
@@ -133,6 +135,14 @@ static int rest(void)
     return rc != 0;
 }
 
+static int turn_off(void)
+{
+    int rc = sceSystemStateMgrTurnOff();
+
+    klog_printf("ps5-mcp:titlectl: off rc=0x%x\n", rc);
+    return rc != 0;
+}
+
 /* The account id (offline-activated or PSN) of user_id, or 0. */
 static uint64_t account_id(uint32_t user_id)
 {
@@ -186,6 +196,8 @@ int main(void)
         return open_url(argument);
     if (strcmp(action, "rest") == 0)
         return rest();
+    if (strcmp(action, "off") == 0)
+        return turn_off();
     if (strcmp(action, "account") == 0 && *argument)
         return report_account(argument);
     klog_printf("ps5-mcp:titlectl: bad-args '%s'\n", action);

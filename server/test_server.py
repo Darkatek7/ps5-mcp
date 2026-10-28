@@ -258,6 +258,10 @@ class FakeElfldr(threading.Thread):
         if action == "rest":
             ddp_server.state = "rest"
             return "rest rc=0x0"
+        if action == "off":
+            ddp_server.state = None
+            self.off = True
+            return "off rc=0x0"
         if action == "account":
             return "account 0x1122334455667788" if argument == "1ea2f4d9" else f"account none user=0x{argument}"
         return f"bad-args '{action}'"
@@ -562,10 +566,19 @@ class FakeRegistration(threading.Thread):
 
     def __init__(self) -> None:
         super().__init__(daemon=True)
-        self.tcp = listener()
-        self.port = self.tcp.getsockname()[1]
-        self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.udp.bind(("127.0.0.1", self.port))
+        # One number for both. UDP picks it: with Docker or Hyper-V, Windows reserves wide UDP port ranges.
+        for _ in range(50):
+            self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.udp.bind(("127.0.0.1", 0))
+            self.port = self.udp.getsockname()[1]
+            self.tcp = socket.socket()
+            try:
+                self.tcp.bind(("127.0.0.1", self.port))
+                self.tcp.listen(4)
+                break
+            except OSError:
+                self.tcp.close()
+                self.udp.close()
         self.pin: str | None = None
         self.account = base64.b64encode((0x1122334455667788).to_bytes(8, "little")).decode()
         threading.Thread(target=self.search, daemon=True).start()
@@ -650,6 +663,20 @@ class Power(unittest.TestCase):
         self.assertEqual(srv.ps5_rest(), "the console is in rest mode")
         self.assertEqual(elfldr.received, [("rest", "")])
         self.assertTrue(srv.ps5_status().startswith("power: rest mode\n"))
+
+    def test_power_off_needs_confirm(self):
+        with self.assertRaisesRegex(ValueError, "confirm=true"):
+            srv.ps5_power_off()
+        self.assertEqual(elfldr.received, [])
+
+    def test_power_off(self):
+        elfldr.off = False
+        # The fake elfldr keeps listening; a console that is off does not.
+        real = srv.elfldr_answers
+        srv.elfldr_answers = lambda: not elfldr.off
+        self.addCleanup(setattr, srv, "elfldr_answers", real)
+        self.assertTrue(srv.ps5_power_off(confirm=True).startswith("the console is turning off"))
+        self.assertEqual(elfldr.received, [("off", "")])
 
     def test_klog_connects_again_after_rest(self):
         self.assertTrue(srv.klog.ready())
