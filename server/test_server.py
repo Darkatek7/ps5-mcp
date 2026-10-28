@@ -281,6 +281,7 @@ class FakeDDP(threading.Thread):
         self.state = "on"
         self.credential = ""
         self.received: list[str] = []
+        self.lose = 0  # wake messages to lose, as a sleeping network part can
 
     def run(self) -> None:
         while True:
@@ -293,7 +294,10 @@ class FakeDDP(threading.Thread):
                            .encode(), sender)
             elif (message.startswith("WAKEUP ") and self.state
                   and f"user-credential:{self.credential}\n" in message):
-                self.state = "on"
+                if self.lose:
+                    self.lose -= 1
+                else:
+                    self.state = "on"
 
 
 SHOT = f"{config.GALLERY}/NPXS40087/NPXS40087/a1/shot.png"
@@ -813,6 +817,13 @@ class Power(unittest.TestCase):
         ddp_server.state = "rest"
         self.assertTrue(srv.ps5_wake(timeout_s=10).startswith("the console is on"))
         self.assertTrue(any(m.startswith("WAKEUP ") for m in ddp_server.received))
+
+    def test_wake_sends_again(self):
+        config.REGIST_KEY = self.KEY
+        ddp_server.state = "rest"
+        ddp_server.lose = 2
+        self.assertTrue(srv.ps5_wake(timeout_s=20).startswith("the console is on"))
+        self.assertGreaterEqual(sum(m.startswith("WAKEUP ") for m in ddp_server.received), 3)
 
     def test_wake_with_wrong_key(self):
         config.REGIST_KEY = b"99999999".hex()

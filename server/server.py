@@ -58,7 +58,7 @@ from ps5mcp.controls import _press, _stick, _touch, parse_buttons  # noqa: E402
 from ps5mcp.klog import klog  # noqa: E402
 from ps5mcp.net import entries, send_elf, user_id  # noqa: E402
 from ps5mcp.power import (_power_seen, ddp, ddp_search, firmware, power_state, power_text,  # noqa: E402
-                          rp_register, saved_regist_key, wake_credential)
+                          RP_SEARCH_PORT, rp_register, saved_regist_key, wake_credential)
 from ps5mcp.remoteeye import _lock, eye  # noqa: E402
 from ps5mcp.screen import _shoot  # noqa: E402
 from ps5mcp.system import (_names, check_title_id, power_call, report_code, running_title,  # noqa: E402
@@ -408,6 +408,19 @@ def ps5_power_off(confirm: bool = False) -> str:
     raise RuntimeError("the console still answered 60 s after the call to turn off")
 
 
+WAKE_RESEND_S = 2
+
+
+def send_wake(message: bytes) -> None:
+    """Sends a wake message, from UDP port 9303 when it is free (the port pyremoteplay notes the PS5 needs)."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        try:
+            s.bind(("", RP_SEARCH_PORT))
+        except OSError:
+            pass
+        s.sendto(message, (IP, DDP_PORT))
+
+
 @mcp.tool()
 def ps5_wake(timeout_s: float = 60) -> str:
     """Wake the console from rest mode over the network (Remote Play's wake message), and wait until elfldr
@@ -424,12 +437,17 @@ def ps5_wake(timeout_s: float = 60) -> str:
         return "the console is already on"
     message = ddp("WAKEUP", {"user-credential": credential, "client-type": "vr", "auth-type": "R",
                              "model": "w", "app-type": "r"})
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        s.sendto(message, (IP, DDP_PORT))
-    start = time.time()
+    start = sent = time.time()
+    send_wake(message)
     while time.time() < start + timeout_s:
-        if power_state() == "on" and net.elfldr_answers():
+        state = power_state()
+        if state == "on" and net.elfldr_answers():
             return f"the console is on (after {time.time() - start:.0f} s)"
+        # One message can get lost while the network part sleeps (seen on 13.00: the first one did nothing,
+        # sent again every few seconds it woke in 13 s), so it goes out again until the console is up.
+        if state != "on" and time.time() >= sent + WAKE_RESEND_S:
+            send_wake(message)
+            sent = time.time()
         time.sleep(1)
     raise RuntimeError(f"the console did not wake within {timeout_s:.0f} s. In rest mode it listens for the wake "
                        "message only with Stay Connected to the Internet and Enable Turning On PS5 from Network "

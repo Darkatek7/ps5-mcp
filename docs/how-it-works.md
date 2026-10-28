@@ -142,7 +142,9 @@ again 11–13 s after it).
 
 `ps5_wake` sends `WAKEUP * HTTP/1.1` with `user-credential:` set to the registration's RegistKey (hex-decoded
 twice, read as one big-endian number, as pyremoteplay does), then waits for 200 and for elfldr to accept a
-connection.
+connection. It sends the message again every 2 s until then: once, after 30 s of rest, a single message did
+nothing, while sent repeatedly it woke the console in 13 s. The messages leave from UDP port 9303 when it is
+free, as the registration's do.
 
 `ps5_pair` is Remote Play's registration, ported from pyremoteplay (`register.py`, `crypt.py`) and checked
 against chiaki-ng's `regist.c`/`rpcrypt.c` (the request is byte for byte pyremoteplay's for the same nonce):
