@@ -6,21 +6,25 @@ and **read its log**. That turns homebrew development into a loop the AI can run
 look, press, look again, close — without a capture card or Remote Play.
 
 ```
-Claude ── MCP (stdio) ── server.py ──┬── TCP ── RemoteEye payload ── /dev/hid ── virtual controller
-                                     ├── FTP ── ftpsrv ── screenshot from the console's gallery
-                                     └── elfldr ── titlectl payload ── start / close titles, browser
-                                                        └── result via klogsrv
+Claude ── MCP (stdio) ── server.py ──┬── TCP ── RemoteEye payload ──┬── /dev/hid ── virtual controller
+                                     │                              └── titles, browser, rest mode, power off
+                                     ├── FTP ── ftpsrv ── screenshot from the console's gallery, files
+                                     ├── TCP ── klogsrv ── kernel log
+                                     └── UDP ── Remote Play discovery ── power state, wake from rest mode
 ```
 
 - **Input:** the `RemoteEye` payload adds a *virtual controller* through the same kernel device Remote Play
   uses and feeds it button and stick states. Verified in the system UI and inside homebrew apps.
 - **Screen:** the virtual controller holds **Create**, the console saves a screenshot to its gallery, and
   the server fetches it over FTP and scales it down (~4 s per screenshot, full composited screen).
-- **Titles:** the small `titlectl` payload asks the system to start or close a title, names the app in front
-  or opens the web browser. The server writes the title id into the ELF before sending it, and reads the
-  answer back from the kernel log (~0.5 s per call).
-- **Files and log:** ftpsrv for files, klogsrv for the kernel log, which the server reads continuously so it
-  can show what happened *before* a call, e.g. right before a crash.
+- **Titles and power:** RemoteEye (build 7 and newer) asks the system to start or close a title, names the
+  app in front, opens the web browser, puts the console in rest mode or turns it off. With an older RemoteEye
+  the small `titlectl` payload does it instead: the server writes the action into the ELF, sends it, and reads
+  the answer back from the kernel log.
+- **Files and log:** ftpsrv for files, klogsrv for the kernel log, which the server reads in the background
+  once a tool needs it, so it can show what happened *before* a call, e.g. right before a crash.
+- **Power:** Remote Play's discovery protocol tells whether the console is on or resting (it also finds the
+  console, so `PS5_IP` is optional), and its wake message brings it back from rest mode.
 
 > Tested on **firmware 13.00** only. The ioctl numbers and request layouts were read from that firmware's
 > `libScePad`; other firmwares may differ. Release builds include the SDK fix that lets payloads start on
@@ -55,7 +59,8 @@ Claude ── MCP (stdio) ── server.py ──┬── TCP ── RemoteEye 
 | `ps5_download(remote_path, local_path)` | Copy a file or folder from the console; small text files are returned directly |
 | `ps5_delete(remote_path, recursive)` | Delete a file, or a folder with `recursive=true` |
 | `ps5_move(from_path, to_path)` | Rename or move on the console |
-| `ps5_status()` | Which console services answer, user, RemoteEye version and controller |
+| `ps5_status()` | Power state, which console services answer, user, RemoteEye version and controller |
+| `ps5_selftest(screenshot)` | Checks every part the tools rely on (console and firmware, loader, FTP, user, RemoteEye, title calls, kernel log, pairing) without changing anything; good on a new console or firmware, and for bug reports |
 
 A typical homebrew loop: `ps5_upload` the app to `/data/homebrew/`, `ps5_rescan`, `ps5_launch`,
 `ps5_screenshot` and `ps5_press` to try it, `ps5_klog(since_s=30)` if it crashed, `ps5_close` when done.
@@ -70,8 +75,8 @@ Buttons: `cross circle square triangle up down left right l1 r1 l2 r2 l3 r3 opti
 **Console** (jailbroken, FW 13.00 tested), running:
 - an ELF loader on port **9021** (elfldr)
 - **ftpsrv** on port 2121
-- **klogsrv** on port 3232 for `ps5_klog`, `log_seconds` and the title tools (they read titlectl's answer
-  from the log)
+- **klogsrv** on port 3232 for `ps5_klog` and `log_seconds`, and for the title and power tools when RemoteEye is
+  older than build 7 (they then read titlectl's answer from the log)
 - optional: **ShadowMountPlus** with its API on port 10101 for `ps5_rescan`
 
 **Console settings:**
@@ -94,19 +99,22 @@ Buttons: `cross circle square triangle up down left right l1 r1 l2 r2 l3 r3 opti
    ```
 3. Register the server with your MCP client. For Claude Code:
    ```
-   claude mcp add ps5 --env PS5_IP=192.168.1.50 -- python /path/to/ps5-mcp/server/server.py
+   claude mcp add ps5 -- python /path/to/ps5-mcp/server/server.py
    ```
-   or copy `.mcp.json.example` to `.mcp.json` in your project and set the paths and IP.
+   or copy `.mcp.json.example` to `.mcp.json` in your project and set the path. The server finds the console
+   on the local network by itself; with several consoles (or none answering) set `PS5_IP`, e.g.
+   `--env PS5_IP=192.168.1.50`.
 4. First use: a new controller appears and the console asks **"Who's using this controller?"** on its
    first input. Pick your user there — with your real controller, or let Claude do it (`ps5_press` to move,
    `cross` to select). Until then screenshots fail, since the Create button of an unassigned controller does
    nothing.
+5. `ps5_selftest` shows whether everything answers.
 
 ### Configuration
 
 | Variable | Default | |
 |---|---|---|
-| `PS5_IP` | — (required) | Console address |
+| `PS5_IP` | the one PS5 that answers a discovery search | Console address |
 | `PS5_USER_ID` | first folder under `/user/home` | User id in hex |
 | `PS5_FTP_PORT` / `PS5_FTP_USER` / `PS5_FTP_PASS` | `2121` / `anonymous` / `anonymous` | ftpsrv login |
 | `PS5_REMOTEEYE_ELF` | `payload/RemoteEye/out/RemoteEye.elf`, then `./RemoteEye.elf` | Payload to start |
@@ -125,15 +133,15 @@ clear them in the Media Gallery from time to time.
 
 ### Rest mode and waking
 
-`ps5_rest` puts the console in rest mode the way its power menu does (`titlectl` calls
-`sceSystemStateMgrEnterStandby`). The payloads keep running and answer again once it wakes, so the jailbreak
+`ps5_rest` puts the console in rest mode the way its power menu does (`sceSystemStateMgrEnterStandby`, from
+RemoteEye or titlectl). The payloads keep running and answer again once it wakes, so the jailbreak
 stays. `ps5_power_off(confirm=true)` turns the console off (`sceSystemStateMgrTurnOff`); that ends the jailbreak,
 and only the power button or a controller turns it on again, so the tool refuses without `confirm=true`.
 
 `ps5_wake` sends Remote Play's wake message, which the console only accepts with the key of a Remote Play
 registration of this PC. Register once with `ps5_pair`: open *Settings → System → Remote Play → Link Device*
 on the console and pass the 8-digit PIN it shows. The server reads the user's account id (signed in to PSN or
-activated offline) with titlectl, registers, and saves the key to `PS5_REGIST_FILE`; a key from
+activated offline) from the registry, registers, and saves the key to `PS5_REGIST_FILE`; a key from
 [pyremoteplay](https://github.com/ktnrg45/pyremoteplay) or chiaki works as `PS5_REGIST_KEY` too.
 
 The console listens for the wake message in rest mode only with both **Stay Connected to the Internet** and
@@ -162,13 +170,25 @@ RemoteEye is written in C# and compiled to a payload ELF with
 address on every 13.x firmware, so on 13.40 and later a payload stopped before its own code ran. Once the fix
 is merged upstream, any later SharpProspero works too.
 
-Clone it next to this repository as `SharpProspero` (or set `SHARPPROSPERO_ROOT`), install its prerequisites,
-then:
+Build with the **.NET SDK 10.0.203** (NativeAOT runtime pack 10.0.7). A build with runtime pack 10.0.14
+crashed on FW 13.00 before RemoteEye's own code ran (SIGILL in the payload's start-up), so the SDK is pinned.
+The release builds come from CI (`.github/workflows/payloads.yml`); the same build in Docker, from the
+repository root with SharpProspero next to it:
+
+```
+docker run --rm -v "$PWD:/repo" -v "$PWD/../SharpProspero:/sp" mcr.microsoft.com/dotnet/sdk:10.0.203 bash -c \
+  "apt-get update -qq && apt-get install -y -qq clang lld zlib1g-dev && pwsh /repo/payload/build.ps1 -SdkRoot /sp"
+```
+
+Or natively: clone SharpProspero next to this repository as `SharpProspero` (or set `SHARPPROSPERO_ROOT`),
+install its prerequisites with that SDK, then:
 
 ```
 pwsh ./payload/build.ps1                      # -> payload/RemoteEye/out/RemoteEye.elf
 pwsh ./payload/build.ps1 -Send -Ip 192.168.1.50
 ```
+
+Rebuilding the same commit gives the same ELF except for a 16-byte build id.
 
 A payload can't be unloaded, and a new instance can't take over the old one's port. RemoteEye therefore
 listens on `3320 + BuildTag`; raise `BuildTag` in `Program.cs` when you change it, and the server picks the
@@ -178,7 +198,8 @@ The server only starts RemoteEye itself when none is running; to switch to a new
 
 ## Building titlectl
 
-titlectl is C, built with the [PS5 payload SDK](https://github.com/ps5-payload-dev/sdk) (Linux or WSL):
+titlectl is C, built with the [PS5 payload SDK](https://github.com/ps5-payload-dev/sdk) v0.45 (Linux, WSL or
+Docker as in the CI workflow); the build is byte-for-byte reproducible:
 
 ```
 PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk bash payload/titlectl/build.sh   # -> payload/titlectl/out/titlectl.elf
@@ -193,7 +214,8 @@ title id after it before each send, so the one build serves every title.
 python -m unittest server/test_server.py
 ```
 
-They run without a console, against a fake RemoteEye, klogsrv and FTP server.
+They run without a console, against a fake RemoteEye, klogsrv, elfldr, FTP server, Remote Play discovery and
+registration. CI runs them on every push (`.github/workflows/tests.yml`).
 
 ## Limitations
 
@@ -210,7 +232,10 @@ They run without a console, against a fake RemoteEye, klogsrv and FTP server.
 - `ps5_launch` starts a title for the user in front; homebrew must be registered first (`ps5_rescan`).
 - Screenshots take ~4 s and appear in the gallery. Screens that forbid captures can't be seen.
 - Holding Create shows a short "screenshot saved" notification that may appear in the next screenshot.
-- RemoteEye serves one client at a time; a second MCP session waits until the first call is done.
+- RemoteEye serves one client at a time; a second MCP session waits up to 15 s for the first call to finish.
+- klogsrv goes silent for everyone while one client is stuck (seen after rest mode). The server reconnects
+  when it notices, and its log reader disconnects after 10 minutes without a log tool, but another program
+  that keeps a stuck connection open keeps klogsrv silent until it lets go.
 
 ## How it works
 

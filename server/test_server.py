@@ -11,6 +11,7 @@ import ftplib
 import importlib.util
 import json
 import os
+import random
 import re
 import socket
 import sys
@@ -73,6 +74,7 @@ _spec = importlib.util.spec_from_file_location("ps5_server", Path(__file__).with
 srv = importlib.util.module_from_spec(_spec)
 sys.modules["ps5_server"] = srv
 _spec.loader.exec_module(srv)
+from ps5mcp import config, controls, net, power, screen
 
 
 class FakeFTP:
@@ -188,6 +190,10 @@ class FakeEye(threading.Thread):
             return "OK\nP 1 0 3 init wait init\nP 80 1 2 payload.elf - main\nEND"
         if line.startswith("KILL ") and self.tag >= 6:
             return "OK rc=0" if line == "KILL 80" else "ERR not a payload: init"
+        command, _, argument = line.partition(" ")
+        if self.tag >= 7 and command in ("LAUNCH", "CLOSE", "RUNNING", "URL", "REST", "OFF", "ACCOUNT"):
+            # titlectl's report, as the fake elfldr would log it.
+            return "OK " + elfldr.report(command.lower(), argument)
         return "ERR unknown"
 
 
@@ -233,7 +239,7 @@ class FakeElfldr(threading.Thread):
                 data = b""
             if not data:  # a port check, as ps5_status and ps5_wake make
                 continue
-            at = data.find(srv.TITLECTL_MARKER + b"\0") + len(srv.TITLECTL_MARKER) + 1
+            at = data.find(config.TITLECTL_MARKER + b"\0") + len(config.TITLECTL_MARKER) + 1
             action, argument = data[at:].split(b"\0")[:2]
             self.received.append((action.decode(), argument.decode()))
             if self.silent:
@@ -283,13 +289,14 @@ class FakeDDP(threading.Thread):
             self.received.append(message)
             if message.startswith("SRCH ") and self.state:
                 status = "200 Ok" if self.state == "on" else "620 Server Standby"
-                DDP.sendto(f"HTTP/1.1 {status}\nhost-type:PS5\n".encode(), sender)
+                DDP.sendto(f"HTTP/1.1 {status}\nhost-name:PS5-054\nhost-type:PS5\nsystem-version:13000040\n"
+                           .encode(), sender)
             elif (message.startswith("WAKEUP ") and self.state
                   and f"user-credential:{self.credential}\n" in message):
                 self.state = "on"
 
 
-SHOT = f"{srv.GALLERY}/NPXS40087/NPXS40087/a1/shot.png"
+SHOT = f"{config.GALLERY}/NPXS40087/NPXS40087/a1/shot.png"
 eye_server = FakeEye()
 eye_server.start()
 klog_server = FakeKlog()
@@ -298,13 +305,13 @@ elfldr = FakeElfldr()
 elfldr.start()
 ddp_server = FakeDDP()
 ddp_server.start()
-srv.ftp = FakeFTP
+net.ftp = FakeFTP
 
 
 def reset_ftp() -> None:
     FakeFTP.files, FakeFTP.dirs, FakeFTP.times = {}, set(), {}
     # An older screenshot, so the gallery is not empty.
-    FakeFTP.put(f"{srv.GALLERY}/NPXS40087/NPXS40087/old/old.png", b"x")
+    FakeFTP.put(f"{config.GALLERY}/NPXS40087/NPXS40087/old/old.png", b"x")
 
 
 class Input(unittest.TestCase):
@@ -318,12 +325,12 @@ class Input(unittest.TestCase):
             srv.parse_buttons("jump")
 
     def test_axis(self):
-        self.assertEqual((srv.axis(-1), srv.axis(0), srv.axis(1)), (0, 128, 255))
+        self.assertEqual((controls.axis(-1), controls.axis(0), controls.axis(1)), (0, 128, 255))
 
     def test_press(self):
         self.assertEqual(srv.ps5_press("cross", hold_ms=0, repeat=2, gap_ms=0), "pressed cross x2")
         states = [l for l in eye_server.lines if l.startswith("STATE")]
-        release = ["STATE 0 128 128 128 128 0 0"] * srv.RELEASE_REPORTS
+        release = ["STATE 0 128 128 128 128 0 0"] * config.RELEASE_REPORTS
         self.assertEqual(states, (["STATE 4000 128 128 128 128 0 0"] + release) * 2)
 
     def test_a_held_press_is_reported_again_and_again_like_a_real_controller(self):
@@ -332,24 +339,24 @@ class Input(unittest.TestCase):
         down = [l for l in states if not l.startswith("STATE 0 ")]
         self.assertGreaterEqual(len(down), 3)
         self.assertTrue(all(l == down[0] for l in down))
-        self.assertEqual(states[len(down):], ["STATE 0 128 128 128 128 0 0"] * srv.RELEASE_REPORTS)
+        self.assertEqual(states[len(down):], ["STATE 0 128 128 128 128 0 0"] * config.RELEASE_REPORTS)
 
     def test_a_new_controller_gets_time_before_the_first_input(self):
         eye_server.handle = -1   # RemoteEye adds the controller on this call
         start = time.time()
         srv.ps5_press("cross", hold_ms=0)
-        self.assertGreaterEqual(time.time() - start, srv.NEW_PAD_SETTLE_S)
+        self.assertGreaterEqual(time.time() - start, config.NEW_PAD_SETTLE_S)
         start = time.time()
         srv.ps5_press("cross", hold_ms=0)   # the controller is there now: no wait
-        self.assertLess(time.time() - start, srv.NEW_PAD_SETTLE_S)
+        self.assertLess(time.time() - start, config.NEW_PAD_SETTLE_S)
 
     def test_touch_block(self):
-        block = srv.touch_block([(1.0, 0.0)], srv.BUTTONS["touchpad"])
-        self.assertEqual(len(block), srv.STATE_SIZE)
+        block = controls.touch_block([(1.0, 0.0)], config.BUTTONS["touchpad"])
+        self.assertEqual(len(block), config.STATE_SIZE)
         self.assertEqual(int.from_bytes(block[0xC:0x10], "little"), 0x100000)
-        self.assertEqual(block[srv.TOUCH_COUNT_AT], 1)
-        at = srv.TOUCH_POINTS_AT[0]
-        self.assertEqual(int.from_bytes(block[at:at + 2], "little"), srv.TOUCHPAD_SIZE[0] - 1)
+        self.assertEqual(block[config.TOUCH_COUNT_AT], 1)
+        at = config.TOUCH_POINTS_AT[0]
+        self.assertEqual(int.from_bytes(block[at:at + 2], "little"), config.TOUCHPAD_SIZE[0] - 1)
 
     def test_touch_needs_v4(self):
         eye_server.tag = 3
@@ -388,10 +395,10 @@ class Screen(unittest.TestCase):
 
     def test_new_shots_only_lists_changed_folders(self):
         with FakeFTP() as f:
-            before = srv.gallery_dirs(f)
-            self.assertEqual(srv.new_shots(f, before), {})
-            FakeFTP.put(f"{srv.GALLERY}/NPXS40087/NPXS40087/old/new.png", b"12345")
-            self.assertEqual(srv.new_shots(f, before), {f"{srv.GALLERY}/NPXS40087/NPXS40087/old/new.png": 5})
+            before = screen.gallery_dirs(f)
+            self.assertEqual(screen.new_shots(f, before), {})
+            FakeFTP.put(f"{config.GALLERY}/NPXS40087/NPXS40087/old/new.png", b"12345")
+            self.assertEqual(screen.new_shots(f, before), {f"{config.GALLERY}/NPXS40087/NPXS40087/old/new.png": 5})
 
     def test_screenshot(self):
         image = srv.ps5_screenshot(max_width=640)
@@ -403,7 +410,7 @@ class Screen(unittest.TestCase):
         picture = PILImage.new("RGB", (100, 100), (0, 0, 255))
         picture.paste((255, 0, 0), (50, 0, 100, 50))
         picture.save(raw, "PNG")
-        cropped = PILImage.open(BytesIO(srv.decode(raw.getvalue(), ".png", 1280, (0.5, 0, 1, 0.5))))
+        cropped = PILImage.open(BytesIO(screen.decode(raw.getvalue(), ".png", 1280, (0.5, 0, 1, 0.5))))
         self.assertEqual(cropped.size, (50, 50))
         r, g, b = cropped.getpixel((25, 25))
         self.assertGreater(r, 200)
@@ -488,10 +495,10 @@ class Titles(unittest.TestCase):
         FakeFTP.put("/user/appmeta/PPSA01234/param.json", param_json("Sample Game"))
         FakeFTP.put("/user/app/PPSA05678/sce_sys/param.json", param_json("Homebrew App") + b"\0")
         tmp = tempfile.NamedTemporaryFile(suffix=".elf", delete=False)
-        tmp.write(b"\x7fELF" + b"code" + srv.TITLECTL_MARKER + b"\0" * 1025 + b"tail")
+        tmp.write(b"\x7fELF" + b"code" + config.TITLECTL_MARKER + b"\0" * 1025 + b"tail")
         tmp.close()
         self.addCleanup(os.unlink, tmp.name)
-        srv.TITLECTL_ELF = Path(tmp.name)
+        config.TITLECTL_ELF = Path(tmp.name)
 
     def test_titles(self):
         self.assertEqual(srv.ps5_titles(), "PPSA01234  Sample Game\nPPSA05678  Homebrew App")
@@ -505,6 +512,20 @@ class Titles(unittest.TestCase):
         self.assertEqual(srv.ps5_close("PPSA05678"), "PPSA05678 is not running")
         self.assertEqual(srv.ps5_close("PPSA01234"), "closed PPSA01234")
         self.assertIsNone(srv.running_title())
+
+    def test_remoteeye_7_answers_without_titlectl(self):
+        eye_server.tag = 7
+        eye_server.lines.clear()
+        try:
+            self.assertEqual(srv.ps5_launch("PPSA01234"), "started PPSA01234 (app id 0x8018)")
+            self.assertEqual(srv.ps5_running(), "PPSA01234 Sample Game (app id 0x8018)")
+            self.assertEqual(srv.ps5_close("PPSA01234"), "closed PPSA01234")
+            self.assertEqual(srv.ps5_open_url("https://example.com/"), "opened https://example.com/")
+        finally:
+            eye_server.tag = 6
+        self.assertEqual(elfldr.received, [])  # no titlectl sent
+        self.assertIn("LAUNCH PPSA01234", eye_server.lines)
+        self.assertIn("RUNNING", eye_server.lines)
 
     def test_launch_errors(self):
         with self.assertRaisesRegex(RuntimeError, "0x8094000a"):
@@ -566,19 +587,22 @@ class FakeRegistration(threading.Thread):
 
     def __init__(self) -> None:
         super().__init__(daemon=True)
-        # One number for both. UDP picks it: with Docker or Hyper-V, Windows reserves wide UDP port ranges.
-        for _ in range(50):
+        # One number for both. With Docker or Hyper-V, Windows reserves wide ranges of the dynamic ports
+        # (49152 and up) per protocol, so the number is picked below them.
+        for _ in range(200):
+            self.port = random.randint(20000, 40000)
             self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self.udp.bind(("127.0.0.1", 0))
-            self.port = self.udp.getsockname()[1]
             self.tcp = socket.socket()
             try:
+                self.udp.bind(("127.0.0.1", self.port))
                 self.tcp.bind(("127.0.0.1", self.port))
                 self.tcp.listen(4)
                 break
             except OSError:
                 self.tcp.close()
                 self.udp.close()
+        else:
+            raise RuntimeError("no port free for both UDP and TCP")
         self.pin: str | None = None
         self.account = base64.b64encode((0x1122334455667788).to_bytes(8, "little")).decode()
         threading.Thread(target=self.search, daemon=True).start()
@@ -605,14 +629,14 @@ class FakeRegistration(threading.Thread):
     def answer(self, body: bytes) -> bytes:
         # Undo the nonce hiding (key 1 is the nonce mixed with RP_REG_KEY_1), as the console does.
         key_1 = body[401:409] + body[199:207]
-        nonce = bytes((((key_1[i] + 45 - i) % 256) ^ srv.RP_REG_KEY_1[i]) for i in range(16))
-        key_0 = bytearray(srv.RP_REG_KEY_0)
+        nonce = bytes((((key_1[i] + 45 - i) % 256) ^ power.RP_REG_KEY_1[i]) for i in range(16))
+        key_0 = bytearray(power.RP_REG_KEY_0)
         for i, byte in enumerate(int(self.pin).to_bytes(4, "big")):
             key_0[12 + i] ^= byte
-        inner = srv._rp_cipher(bytes(key_0), nonce, False).update(body[480:])
+        inner = power._rp_cipher(bytes(key_0), nonce, False).update(body[480:])
         if f"Np-AccountId: {self.account}\r\n".encode() not in inner:
             return b"HTTP/1.1 403 Forbidden\r\n\r\n"
-        reply = srv._rp_cipher(bytes(key_0), nonce, True).update(
+        reply = power._rp_cipher(bytes(key_0), nonce, True).update(
             b"PS5-Mac: B41F4D2FFF33\r\nPS5-RegistKey: " + b"0a1b2c3d".hex().encode()
             + b"\r\nPS5-Nickname: PS5-054\r\n")
         return b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(reply) + reply
@@ -632,15 +656,15 @@ class Power(unittest.TestCase):
         ddp_server.received.clear()
         elfldr.received.clear()
         tmp = tempfile.NamedTemporaryFile(suffix=".elf", delete=False)
-        tmp.write(b"\x7fELF" + srv.TITLECTL_MARKER + b"\0" * 1025)
+        tmp.write(b"\x7fELF" + config.TITLECTL_MARKER + b"\0" * 1025)
         tmp.close()
         self.addCleanup(os.unlink, tmp.name)
-        srv.TITLECTL_ELF = Path(tmp.name)
-        self.addCleanup(setattr, srv, "REGIST_KEY", srv.REGIST_KEY)
-        self.addCleanup(setattr, srv, "REGIST_FILE", srv.REGIST_FILE)
-        self.addCleanup(setattr, srv, "RP_PORT", srv.RP_PORT)
-        srv.REGIST_FILE = Path(tempfile.mkdtemp()) / "regist.json"
-        srv.RP_PORT = registration.port
+        config.TITLECTL_ELF = Path(tmp.name)
+        self.addCleanup(setattr, config, "REGIST_KEY", config.REGIST_KEY)
+        self.addCleanup(setattr, config, "REGIST_FILE", config.REGIST_FILE)
+        self.addCleanup(setattr, power, "RP_PORT", power.RP_PORT)
+        config.REGIST_FILE = Path(tempfile.mkdtemp()) / "regist.json"
+        power.RP_PORT = registration.port
         registration.pin = None
 
     def test_ddp_message(self):
@@ -664,6 +688,38 @@ class Power(unittest.TestCase):
         self.assertEqual(elfldr.received, [("rest", "")])
         self.assertTrue(srv.ps5_status().startswith("power: rest mode\n"))
 
+    def test_selftest(self):
+        FakeFTP.dirs.add("/user/home/1ea2f4d9")
+        FakeFTP.dirs.add("/user/app")
+        config.REGIST_KEY = ""
+        # FTP is faked in-process; any listening port stands in for ftpsrv's.
+        self.addCleanup(setattr, config, "FTP_PORT", config.FTP_PORT)
+        config.FTP_PORT = config.KLOG_PORT
+        report = srv.ps5_selftest()
+        self.assertTrue(report.endswith("all checks passed"), report)
+        self.assertIn("ok    console: PS5-054 at 127.0.0.1, firmware 13.00, on", report)
+        self.assertIn("ok    title calls: running none", report)
+        self.assertIn("none yet (ps5_pair", report)
+
+    def test_parse_ddp_and_firmware(self):
+        fields = config.parse_ddp(b"HTTP/1.1 620 Server Standby\nhost-name:PS5-054\nsystem-version:13000040\n")
+        self.assertEqual((fields["status"], fields["host-name"]), ("620", "PS5-054"))
+        self.assertEqual(srv.firmware(fields["system-version"]), "13.00")
+        self.assertEqual(srv.firmware(""), "?")
+
+    def test_outdated_titlectl(self):
+        with self.assertRaisesRegex(RuntimeError, "older than this server"):
+            srv.titlectl("nonsense")
+
+    def test_power_text_remembers_rest(self):
+        power._power_seen[0] = None
+        ddp_server.state = None
+        self.assertEqual(srv.power_text(), "no answer (off, or not on the network)")
+        ddp_server.state = "rest"
+        self.assertEqual(srv.power_text(), "rest mode")
+        ddp_server.state = None
+        self.assertTrue(srv.power_text().startswith("no answer (it was resting"))
+
     def test_power_off_needs_confirm(self):
         with self.assertRaisesRegex(ValueError, "confirm=true"):
             srv.ps5_power_off()
@@ -672,9 +728,9 @@ class Power(unittest.TestCase):
     def test_power_off(self):
         elfldr.off = False
         # The fake elfldr keeps listening; a console that is off does not.
-        real = srv.elfldr_answers
-        srv.elfldr_answers = lambda: not elfldr.off
-        self.addCleanup(setattr, srv, "elfldr_answers", real)
+        real = net.elfldr_answers
+        net.elfldr_answers = lambda: not elfldr.off
+        self.addCleanup(setattr, net, "elfldr_answers", real)
         self.assertTrue(srv.ps5_power_off(confirm=True).startswith("the console is turning off"))
         self.assertEqual(elfldr.received, [("off", "")])
 
@@ -690,17 +746,17 @@ class Power(unittest.TestCase):
         # Rested and woke between two calls: the reader sees it on its own.
         before = srv.klog.sock
         ddp_server.state = "on"
-        time.sleep(srv.POWER_CHECK_S + 2)
+        time.sleep(config.POWER_CHECK_S + 2)
         self.assertTrue(srv.klog.connected.is_set())
         self.assertIsNot(srv.klog.sock, before)
         self.assertEqual(srv.klog.power, "on")
 
     def test_pair_saves_the_key_and_wake_uses_it(self):
-        srv.REGIST_KEY = ""
+        config.REGIST_KEY = ""
         registration.pin = "13589201"
         self.assertTrue(srv.ps5_pair("1358 9201").startswith("paired as Remote Play device of PS5-054"))
         self.assertEqual(elfldr.received, [("account", "1ea2f4d9")])
-        saved = json.loads(srv.REGIST_FILE.read_text())
+        saved = json.loads(config.REGIST_FILE.read_text())
         self.assertEqual(saved["127.0.0.1"]["PS5-RegistKey"], self.KEY)
         ddp_server.state = "rest"
         self.assertTrue(srv.ps5_wake(timeout_s=10).startswith("the console is on"))
@@ -717,7 +773,17 @@ class Power(unittest.TestCase):
                 srv.ps5_pair("13589201")
         finally:
             registration.account = account
-        self.assertFalse(srv.REGIST_FILE.exists())
+        self.assertFalse(config.REGIST_FILE.exists())
+
+    def test_klog_reader_stops_when_idle(self):
+        self.assertTrue(srv.klog.ready())
+        self.addCleanup(setattr, config, "KLOG_IDLE_S", config.KLOG_IDLE_S)
+        config.KLOG_IDLE_S = 0.5
+        srv.klog.thread.join(5)
+        self.assertFalse(srv.klog.thread.is_alive())
+        self.assertFalse(srv.klog.connected.is_set())
+        config.KLOG_IDLE_S = 600
+        self.assertTrue(srv.klog.ready())
 
     def test_klog_connects_again_when_klogsrv_goes_quiet(self):
         self.assertTrue(srv.klog.ready())
@@ -736,26 +802,26 @@ class Power(unittest.TestCase):
         self.assertIsNot(srv.klog.sock, before)
 
     def test_wake_needs_key(self):
-        srv.REGIST_KEY = ""
+        config.REGIST_KEY = ""
         ddp_server.state = "rest"
         with self.assertRaisesRegex(RuntimeError, "PS5_REGIST_KEY"):
             srv.ps5_wake()
 
     def test_wake(self):
-        srv.REGIST_KEY = self.KEY
+        config.REGIST_KEY = self.KEY
         self.assertEqual(srv.ps5_wake(), "the console is already on")
         ddp_server.state = "rest"
         self.assertTrue(srv.ps5_wake(timeout_s=10).startswith("the console is on"))
         self.assertTrue(any(m.startswith("WAKEUP ") for m in ddp_server.received))
 
     def test_wake_with_wrong_key(self):
-        srv.REGIST_KEY = b"99999999".hex()
+        config.REGIST_KEY = b"99999999".hex()
         ddp_server.state = "rest"
         with self.assertRaisesRegex(RuntimeError, "did not wake"):
             srv.ps5_wake(timeout_s=2)
 
     def test_wake_when_the_network_sleeps(self):
-        srv.REGIST_KEY = self.KEY
+        config.REGIST_KEY = self.KEY
         ddp_server.state = None
         with self.assertRaisesRegex(RuntimeError, "Stay Connected to the Internet"):
             srv.ps5_wake(timeout_s=2)

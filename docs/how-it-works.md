@@ -24,9 +24,15 @@ Called from a payload process, these never return:
 They talk to system services over IPC, which apparently never answers a payload process. `libSceAvcap2`
 (live composited frames) loads and resolves but was not pursued for the same reason.
 
-That holds for SharpProspero payloads, which load the module themselves. A payload built with the C
-[ps5-payload-sdk](https://github.com/ps5-payload-dev/sdk), linked against `libSceSystemService` and
-`libSceUserService`, calls `sceSystemServiceLaunchApp` and friends and gets answers (see *Titles* below).
+That holds for SharpProspero payloads that load the module themselves at run time. Listed as `DT_NEEDED`
+instead (`<ProsperoSprx>` in the project), `libSceSystemService`, `libSceUserService` and `libSceRegMgr` work:
+RemoteEye 7 calls `sceSystemServiceLaunchApp`, `sceLncUtil*`, `sceSystemStateMgr*` and `sceRegMgrGet*` and
+gets answers, as does a payload built with the C [ps5-payload-sdk](https://github.com/ps5-payload-dev/sdk)
+(titlectl). `sceUserServiceGetForegroundUser` answers `0xffffffff` in both, also with a user signed in.
+
+The NativeAOT runtime pack matters: RemoteEye built with runtime pack 10.0.14 (.NET SDK 10.0.4xx) died with
+SIGILL in the payload's start-up, before `Main`, while the same source with 10.0.7 (SDK 10.0.203) runs. The
+build is pinned to that SDK.
 
 ## FW 13.40 and later
 
@@ -95,6 +101,11 @@ and its NUL, so the one ELF can name any title without a compiler on the PC. elf
 titlectl writes its result to the kernel log as one `ps5-mcp:titlectl: ...` line, which the server reads from
 its klogsrv connection. A round trip takes 0.2–0.8 s.
 
+RemoteEye 7 and newer serve the same actions over their own connection (`LAUNCH`, `CLOSE`, `RUNNING`, `URL`,
+`REST`, `OFF`, `ACCOUNT`, in `payload/RemoteEye/SystemCalls.cs`) and answer `OK ` plus the very report titlectl
+would log, so the server parses both alike. It uses RemoteEye when the newest instance is build 7 or later, and
+titlectl otherwise; no payload is sent and klogsrv is not needed for these calls then.
+
 | Action | Calls | Report |
 |---|---|---|
 | `launch` | `sceUserServiceGetForegroundUser`, `sceSystemServiceLaunchApp(title id, args, {user})` | `launch <id> rc=0x...`: the new app id, negative on error |
@@ -156,7 +167,8 @@ process can be hit.
 ## The log
 
 klogsrv sends every kernel log line to every connected client, so the server keeps one connection open in the
-background and stamps each line with the time it arrived. `ps5_klog(since_s=...)` can then show what was logged
+background (from the first tool that needs the log until 10 minutes without one) and stamps each line with the
+time it arrived. `ps5_klog(since_s=...)` can then show what was logged
 before the call, and other log readers still get every line.
 
 klogsrv writes to each client in turn and opens `/dev/klog` only while it has clients; it opens it again only
@@ -164,7 +176,14 @@ after the last one has left. On 13.00 it sometimes stops sending anything while 
 after rest mode, once without). Then every titlectl call times out, because its answer never arrives. The
 server therefore connects again when the power state changed since it connected (checked every 3 s), when the
 log has been quiet for 60 s before a call, and when a titlectl call saw no line at all. That only helps when it
-is klogsrv's last client: another ps5-mcp server or log reader that stays connected keeps it silent.
+is klogsrv's last client: another ps5-mcp server or log reader that stays connected keeps it silent. Hence the
+reader only runs while tools use the log, and RemoteEye 7 takes the title and power calls off klogsrv.
+
+## Finding the console
+
+Without `PS5_IP`, the server sends a discovery search (`SRCH`, UDP 9302) from each of the PC's IPv4 addresses
+to the broadcast addresses and takes the one PS5 that answers. A plain broadcast is not enough on Windows: it
+leaves through one adapter only, often a virtual one (WSL, Hyper-V). The search needs no jailbreak and no key.
 
 Deleting the files afterwards over FTP leaves the gallery's database entry behind, shown as a blank tile in
 the Media Gallery, so that is opt-in.
