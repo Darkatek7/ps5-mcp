@@ -9,7 +9,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 
-from .config import BLOCK_TAG, BUSY_WAIT_S, IP, NEW_PAD_SETTLE_S, REMOTEEYE_ELF, REMOTEEYE_PORTS
+from .config import (BLOCK_TAG, BUSY_WAIT_S, IP, NEW_PAD_SETTLE_S, REMOTEEYE_ELF, REMOTEEYE_PORTS,
+                     SYSTEM_TAG)
 from .net import send_elf, user_id
 
 _lock = threading.Lock()
@@ -187,3 +188,13 @@ class RemoteEye:
 
 
 eye = RemoteEye()
+
+
+def outdated_note(tag: int) -> str:
+    """What a RemoteEye older than build SYSTEM_TAG misses, or "" for a current one. Title and power calls still
+    work with an older one, through titlectl and klogsrv, so this is advice rather than an error."""
+    if tag >= SYSTEM_TAG:
+        return ""
+    return (f"v{tag} runs, while v{SYSTEM_TAG} and newer answer title and power calls themselves (no titlectl, no "
+            "klogsrv): send RemoteEye.elf from release v0.3.0 or later with ps5_send_payload, or restart the "
+            "console so the server starts its own copy")

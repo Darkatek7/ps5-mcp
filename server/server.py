@@ -53,13 +53,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from ps5mcp import config, net  # noqa: E402
 from ps5mcp.config import (BLOCK_TAG, DDP_PORT, DOWNLOAD_DIR, ELFLDR_PORT, INLINE_TEXT_LIMIT, IP,  # noqa: E402
-                           KLOG_PORT, PS_TAG, SMP_PORT, SYSTEM_TAG)
+                           KLOG_PORT, PS_TAG, SMP_PORT)
 from ps5mcp.controls import _press, _stick, _touch, parse_buttons  # noqa: E402
 from ps5mcp.klog import klog  # noqa: E402
 from ps5mcp.net import entries, send_elf, user_id  # noqa: E402
 from ps5mcp.power import (_power_seen, ddp, ddp_search, firmware, power_state, power_text,  # noqa: E402
                           RP_SEARCH_PORT, rp_register, saved_regist_key, wake_credential)
-from ps5mcp.remoteeye import _lock, eye  # noqa: E402
+from ps5mcp.remoteeye import _lock, eye, outdated_note  # noqa: E402
 from ps5mcp.screen import _shoot  # noqa: E402
 from ps5mcp.system import (_names, check_title_id, power_call, report_code, running_title,  # noqa: E402
                            title_name, titlectl)
@@ -700,6 +700,8 @@ def ps5_status() -> str:
                 attached = ("controller attached (if screenshots fail, the console may still ask \"Who's using "
                             "this controller?\": ps5_press right, then cross)")
             lines.append(f"remoteeye: v{tag}, {attached} ({reply})")
+            if outdated_note(tag):
+                lines.append(f"remoteeye: {outdated_note(tag)}")
             if tag < BLOCK_TAG:
                 lines.append(f"remoteeye: v{tag} has no touch input; send v{BLOCK_TAG} or newer for ps5_touch")
             if len(found) > 1:
@@ -741,9 +743,8 @@ def ps5_selftest(screenshot: bool = False) -> str:
     def remoteeye():
         with _lock, eye.session() as e:
             reply = e.call("PING")
-        if eye.tag < SYSTEM_TAG:
-            reply += f" (v{SYSTEM_TAG} and newer answer title and power calls without klogsrv)"
-        return reply
+        note = outdated_note(eye.tag)
+        return f"{reply} ({note})" if note else reply
 
     def kernel_log():
         if not klog.ready():

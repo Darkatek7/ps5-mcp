@@ -739,6 +739,27 @@ class Power(unittest.TestCase):
         self.assertIn("ok    title calls: running none", report)
         self.assertIn("none yet (ps5_pair", report)
 
+    def test_outdated_remoteeye_is_named(self):
+        FakeFTP.dirs.add("/user/home/1ea2f4d9")
+        FakeFTP.dirs.add("/user/app")
+        self.addCleanup(setattr, config, "FTP_PORT", config.FTP_PORT)
+        config.FTP_PORT = config.KLOG_PORT
+        eye_server.tag = 6
+        try:
+            status, report = srv.ps5_status(), srv.ps5_selftest()
+        finally:
+            eye_server.tag = 6
+        self.assertIn("remoteeye: v6 runs, while v7 and newer answer title and power calls themselves", status)
+        self.assertIn("send RemoteEye.elf from release v0.3.0 or later", status)
+        self.assertRegex(report, r"ok    RemoteEye: .*v6 runs, while v7")
+        self.assertTrue(report.endswith("all checks passed"), report)
+        eye_server.tag = 7
+        try:
+            status, report = srv.ps5_status(), srv.ps5_selftest()
+        finally:
+            eye_server.tag = 6
+        self.assertNotIn("runs, while", status + report)
+
     def test_parse_ddp_and_firmware(self):
         fields = config.parse_ddp(b"HTTP/1.1 620 Server Standby\nhost-name:PS5-054\nsystem-version:13000040\n")
         self.assertEqual((fields["status"], fields["host-name"]), ("620", "PS5-054"))
