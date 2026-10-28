@@ -16,6 +16,17 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 
+  <!-- SystemCalls.cs: titles, browser, power and the account id. -->
+  <ItemGroup>
+    <ProsperoSprx Include="libSceSystemService.sprx" />
+    <ProsperoSprx Include="libSceUserService.sprx" />
+    <ProsperoSprx Include="libSceRegMgr.sprx" />
+    <DirectPInvoke Include="libSceSystemService" />
+    <DirectPInvoke Include="libSceSystemStateMgr" />
+    <DirectPInvoke Include="libSceUserService" />
+    <DirectPInvoke Include="libSceRegMgr" />
+  </ItemGroup>
+
   <ItemGroup>
     <ProjectReference Include="$(SharpProsperoRoot)\src\SharpProspero\SharpProspero.csproj" />
   </ItemGroup>

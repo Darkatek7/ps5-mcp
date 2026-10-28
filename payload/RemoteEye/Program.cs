@@ -32,6 +32,7 @@
 //   DETACH                             remove the controller
 //   PS                                 the process table (Processes.cs)
 //   KILL <pid> [signal]                end a hung payload (only payload.elf, never RemoteEye; signal 9)
+//   LAUNCH CLOSE RUNNING URL REST OFF ACCOUNT   titles, browser, power, account id (SystemCalls.cs; build 7)
 
 using System;
 using System.Runtime.InteropServices;
@@ -46,7 +47,7 @@ internal static unsafe class Program
     // keeps receiving, so each build listens on PortBase + BuildTag. Raise BuildTag on each rebuild; the
     // PC scans the range for the newest.
     private const ushort PortBase = 3320;
-    private const int BuildTag = 6;
+    private const int BuildTag = 7;
     private const int MaxLine = 512;
 
     private const int SysIoctl = 54;
@@ -115,6 +116,23 @@ internal static unsafe class Program
                 Processes.ServeList(client);
             else if (StartsWith(line, "KILL "))
                 ServeKill(client, line + 5);
+            else if (StartsWith(line, "LAUNCH "))
+                SystemCalls.Launch(client, Argument(line + 7));
+            else if (StartsWith(line, "CLOSE "))
+                SystemCalls.Close(client, Argument(line + 6));
+            else if (StartsWith(line, "RUNNING"))
+                SystemCalls.Running(client);
+            else if (StartsWith(line, "URL "))
+                SystemCalls.Url(client, Argument(line + 4));
+            else if (StartsWith(line, "REST"))
+                SystemCalls.Rest(client);
+            else if (StartsWith(line, "OFF"))
+                SystemCalls.Off(client);
+            else if (StartsWith(line, "ACCOUNT "))
+            {
+                byte* args = line + 8;
+                SystemCalls.Account(client, (uint)ParseHex(ref args));
+            }
             else
                 Send(client, "ERR unknown\n"u8);
         }
@@ -309,6 +327,13 @@ internal static unsafe class Program
     }
 
     // ---- text helpers ----
+
+    /// <summary>The rest of the line after leading spaces (the line is NUL-terminated).</summary>
+    private static byte* Argument(byte* text)
+    {
+        while (*text == (byte)' ') text++;
+        return text;
+    }
 
     private static bool StartsWith(byte* line, string prefix)
     {
