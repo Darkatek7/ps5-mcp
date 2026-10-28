@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ps5-mcp"
+version = "0.3.1"
+description = "MCP server that gives an AI eyes and hands on a jailbroken PS5: screenshots, controller input, titles, files, power"
+readme = "README.md"
+license = "GPL-3.0-only"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.2,<2",
+    "Pillow>=10",
+    "cryptography>=3.4",
+]
+
+[project.optional-dependencies]
+# HDR (JPEG XR) screenshots outside Windows.
+hdr = ["imagecodecs"]
+
+[project.scripts]
+ps5-mcp = "ps5mcp.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Darkatek7/ps5-mcp"
+
+[tool.setuptools]
+package-dir = { "" = "server" }
+packages = ["ps5mcp"]
+
+[tool.setuptools.package-data]
+ps5mcp = ["jxr2png.ps1"]

@@ -21,3 +21,16 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: pip install -r server/requirements.txt
       - run: python -m unittest server/test_server.py
+
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the package and start the command
+        run: |
+          pip install .
+          ps5-mcp bogus 2>&1 | grep -q "usage: ps5-mcp"
+          python -c "import importlib.resources as r; assert (r.files('ps5mcp') / 'jxr2png.ps1').is_file()"

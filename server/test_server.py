@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import base64
 import ftplib
-import importlib.util
+import hashlib
 import json
 import os
 import random
@@ -69,12 +69,10 @@ os.environ.update({
     "PS5_SMP_PORT": str(SMP.server_address[1]),
     "PS5_DDP_PORT": str(DDP.getsockname()[1]),
 })
-# Loaded by path: run from the repository root, "import server" would find the server/ folder instead.
-_spec = importlib.util.spec_from_file_location("ps5_server", Path(__file__).with_name("server.py"))
-srv = importlib.util.module_from_spec(_spec)
-sys.modules["ps5_server"] = srv
-_spec.loader.exec_module(srv)
-from ps5mcp import config, controls, net, power, remoteeye, screen
+# The package sits next to this file, as server/server.py has it.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from ps5mcp import config, controls, net, power, remoteeye, screen  # noqa: E402
+from ps5mcp import tools as srv  # noqa: E402
 
 
 class FakeFTP:
@@ -891,6 +889,60 @@ class Power(unittest.TestCase):
         ddp_server.state = None
         with self.assertRaisesRegex(RuntimeError, "Stay Connected to the Internet"):
             srv.ps5_wake(timeout_s=2)
+
+
+class FakeReleases(BaseHTTPRequestHandler):
+    """GitHub's latest-release answer and its assets, from FILES (path -> bytes)."""
+
+    FILES: dict[str, bytes] = {}
+
+    def do_GET(self):
+        data = self.FILES.get(self.path)
+        self.send_response(200 if data is not None else 404)
+        self.send_header("Content-Length", str(len(data or b"")))
+        self.end_headers()
+        self.wfile.write(data or b"")
+
+    def log_message(self, *args):
+        pass
+
+
+class Packaging(unittest.TestCase):
+    def setUp(self):
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), FakeReleases)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.shutdown)
+        base = f"http://127.0.0.1:{self.server.server_address[1]}"
+        self.payloads = {"RemoteEye.elf": b"\x7fELF remoteeye", "titlectl.elf": b"\x7fELF titlectl"}
+        sums = "".join(f"{hashlib.sha256(data).hexdigest()}  {name}\n" for name, data in self.payloads.items())
+        assets = [{"name": n, "browser_download_url": f"{base}/{n}"} for n in [*self.payloads, "SHA256SUMS"]]
+        FakeReleases.FILES = {"/latest": json.dumps({"tag_name": "v9.9.9", "assets": assets}).encode(),
+                              "/SHA256SUMS": sums.encode(),
+                              **{f"/{n}": d for n, d in self.payloads.items()}}
+        self.releases = f"{base}/latest"
+        self.folder = Path(tempfile.mkdtemp())
+
+    def test_fetch_payloads(self):
+        from ps5mcp.fetch import fetch_payloads
+
+        report = fetch_payloads(self.folder, self.releases)
+        self.assertEqual(report[0], "release v9.9.9")
+        for name, data in self.payloads.items():
+            self.assertEqual((self.folder / name).read_bytes(), data)
+
+    def test_a_payload_that_does_not_match_is_not_written(self):
+        from ps5mcp.fetch import fetch_payloads
+
+        FakeReleases.FILES["/titlectl.elf"] = b"something else"
+        with self.assertRaisesRegex(RuntimeError, "titlectl.elf of release v9.9.9 does not match"):
+            fetch_payloads(self.folder, self.releases)
+        self.assertFalse((self.folder / "titlectl.elf").exists())
+
+    def test_usage(self):
+        from ps5mcp.cli import main
+
+        with self.assertRaisesRegex(SystemExit, "usage: ps5-mcp"):
+            main(["bogus"])
 
 
 if __name__ == "__main__":

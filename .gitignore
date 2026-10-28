@@ -5,3 +5,6 @@ out/
 __pycache__/
 *.pyc
 .mcp.json
+*.egg-info/
+build/
+dist/

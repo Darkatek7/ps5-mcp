@@ -70,20 +70,32 @@ ELFLDR_PORT = int(os.environ.get("PS5_ELFLDR_PORT", "9021"))
 KLOG_PORT = int(os.environ.get("PS5_KLOG_PORT", "3232"))
 _first, _, _last = os.environ.get("PS5_REMOTEEYE_PORTS", "3321-3340").partition("-")
 REMOTEEYE_PORTS = range(int(_first), int(_last or _first) + 1)
+# A checkout's root (server/ps5mcp/config.py is two folders down); for an installed package it names a folder
+# that holds no payloads, which is harmless.
 REPO = Path(__file__).resolve().parents[2]
-REMOTEEYE_ELF = Path(os.environ["PS5_REMOTEEYE_ELF"]) if os.environ.get("PS5_REMOTEEYE_ELF") else next(
-    (p for p in (REPO / "payload" / "RemoteEye" / "out" / "RemoteEye.elf", REPO / "RemoteEye.elf") if p.exists()),
-    REPO / "RemoteEye.elf")
-TITLECTL_ELF = Path(os.environ["PS5_TITLECTL_ELF"]) if os.environ.get("PS5_TITLECTL_ELF") else next(
-    (p for p in (REPO / "payload" / "titlectl" / "out" / "titlectl.elf", REPO / "titlectl.elf") if p.exists()),
-    REPO / "titlectl.elf")
+# Where "ps5-mcp fetch-payloads" puts the payloads of a release.
+PAYLOAD_DIR = Path(os.environ.get("PS5_PAYLOAD_DIR") or Path.home() / ".ps5-mcp" / "payloads")
+
+
+def payload(env: str, build: Path, name: str) -> Path:
+    """The payload the environment names, else the first that exists of: the checkout's build, the checkout's
+    root (where a release download goes), PAYLOAD_DIR."""
+    if os.environ.get(env):
+        return Path(os.environ[env])
+    places = (build, REPO / name, PAYLOAD_DIR / name)
+    return next((p for p in places if p.exists()), PAYLOAD_DIR / name)
+
+
+REMOTEEYE_ELF = payload("PS5_REMOTEEYE_ELF", REPO / "payload" / "RemoteEye" / "out" / "RemoteEye.elf",
+                        "RemoteEye.elf")
+TITLECTL_ELF = payload("PS5_TITLECTL_ELF", REPO / "payload" / "titlectl" / "out" / "titlectl.elf", "titlectl.elf")
 SMP_PORT = int(os.environ.get("PS5_SMP_PORT", "10101"))
 REGIST_KEY = os.environ.get("PS5_REGIST_KEY", "")
 REGIST_FILE = Path(os.environ.get("PS5_REGIST_FILE") or Path.home() / ".ps5-mcp" / "regist.json")
 POWER_CHECK_S = 3
 KLOG_QUIET_S = 60
 KLOG_IDLE_S = 600
-JXR2PNG = Path(__file__).resolve().parents[1] / "jxr2png.ps1"
+JXR2PNG = Path(__file__).with_name("jxr2png.ps1")
 GALLERY = "/user/av_contents/photo"
 THUMBNAILS = "/user/av_contents/thumbnails/photo"
 DELETE_SHOTS = os.environ.get("PS5_DELETE_SHOTS") == "1"

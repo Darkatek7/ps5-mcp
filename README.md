@@ -91,8 +91,24 @@ Buttons: `cross circle square triangle up down left right l1 r1 l2 r2 l3 r3 opti
 
 ## Setup
 
+**With [uv](https://docs.astral.sh/uv/)**, no checkout needed:
+
+1. Download the payloads of the latest release (checked against its `SHA256SUMS`) to `~/.ps5-mcp/payloads`:
+   ```
+   uvx --from git+https://github.com/Darkatek7/ps5-mcp ps5-mcp fetch-payloads
+   ```
+2. Register the server with your MCP client. For Claude Code:
+   ```
+   claude mcp add ps5 -- uvx --from git+https://github.com/Darkatek7/ps5-mcp ps5-mcp
+   ```
+   (`pip install git+https://github.com/Darkatek7/ps5-mcp` installs the same `ps5-mcp` command.)
+
+**From a checkout:**
+
 1. Get `RemoteEye.elf` and `titlectl.elf` from the [releases](../../releases) and put them in the repository
-   root (or build them, see below). You don't have to send them yourself — the server does when needed.
+   root (or build them, see below; or `python server/server.py fetch-payloads` puts them in
+   `~/.ps5-mcp/payloads`, which the server searches too). You don't have to send them yourself — the server
+   does when needed.
 2. Install the Python dependencies:
    ```
    pip install -r server/requirements.txt
@@ -101,15 +117,17 @@ Buttons: `cross circle square triangle up down left right l1 r1 l2 r2 l3 r3 opti
    ```
    claude mcp add ps5 -- python /path/to/ps5-mcp/server/server.py
    ```
-   or copy `.mcp.json.example` to `.mcp.json` in your project and set the path. The server finds the console
-   on the local network by itself; with several consoles (or none answering) set `PS5_IP`, e.g.
-   `--env PS5_IP=192.168.1.50`.
-4. First use: a new controller appears and the console asks **"Who's using this controller?"** on its
+   or copy `.mcp.json.example` to `.mcp.json` in your project and set the path.
+
+The server finds the console on the local network by itself; with several consoles (or none answering) set
+`PS5_IP`, e.g. `--env PS5_IP=192.168.1.50`. Then:
+
+1. First use: a new controller appears and the console asks **"Who's using this controller?"** on its
    first input; until it is answered, the Create button does nothing. When the first screenshot of a controller
    the server just added fails, the server answers the prompt itself once (right, then cross: the user next to
    it, right on a console with one user) and tries again, so that first screenshot takes ~20 s. With several
    users, pick yours with your real controller (or `ps5_press`) instead.
-5. `ps5_selftest` shows whether everything answers.
+2. `ps5_selftest` shows whether everything answers.
 
 ### Configuration
 
@@ -118,8 +136,9 @@ Buttons: `cross circle square triangle up down left right l1 r1 l2 r2 l3 r3 opti
 | `PS5_IP` | the one PS5 that answers a discovery search | Console address |
 | `PS5_USER_ID` | first folder under `/user/home` | User id in hex |
 | `PS5_FTP_PORT` / `PS5_FTP_USER` / `PS5_FTP_PASS` | `2121` / `anonymous` / `anonymous` | ftpsrv login |
-| `PS5_REMOTEEYE_ELF` | `payload/RemoteEye/out/RemoteEye.elf`, then `./RemoteEye.elf` | Payload to start |
-| `PS5_TITLECTL_ELF` | `payload/titlectl/out/titlectl.elf`, then `./titlectl.elf` | Payload for the title tools |
+| `PS5_REMOTEEYE_ELF` | `payload/RemoteEye/out/RemoteEye.elf`, then `./RemoteEye.elf`, then `PS5_PAYLOAD_DIR` | Payload to start |
+| `PS5_TITLECTL_ELF` | `payload/titlectl/out/titlectl.elf`, then `./titlectl.elf`, then `PS5_PAYLOAD_DIR` | Payload for the title tools |
+| `PS5_PAYLOAD_DIR` | `~/.ps5-mcp/payloads` | Where `ps5-mcp fetch-payloads` puts the payloads |
 | `PS5_SMP_PORT` | `10101` | ShadowMountPlus API port |
 | `PS5_DELETE_SHOTS` | off | Delete each screenshot after fetching it (see below) |
 | `PS5_SAVE_DIR` | — | Keep the original full-resolution file of every screenshot in this folder |
