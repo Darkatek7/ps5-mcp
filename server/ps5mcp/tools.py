@@ -1,8 +1,7 @@
 """MCP server that lets Claude see the PS5 screen, press its buttons and move files to and from it.
 
-Input goes through the RemoteEye payload (payload/RemoteEye), a virtual controller on the console. The screen is
-captured by the console itself: holding that controller's Create button saves a screenshot to the gallery,
-which is fetched over FTP, decoded and scaled down here.
+Input goes through the RemoteEye payload (payload/RemoteEye), a virtual controller on the console. Direct
+Avcap2 screenshots on firmware 13.00 SDR need no controller; the compatibility backend uses Create and the gallery.
 
 Console services it uses: elfldr (9021) to start RemoteEye, titlectl and other payloads, ftpsrv (2121) for
 screenshots and files, klogsrv (3232) for the log, RemoteEye on 3320 + its build tag, and optionally
@@ -17,6 +16,9 @@ Configuration (environment):
   PS5_REMOTEEYE_ELF  path to RemoteEye.elf; default: payload/RemoteEye/out/RemoteEye.elf, then RemoteEye.elf
                      in the repository root (where a release download goes)
   PS5_TITLECTL_ELF   path to titlectl.elf (starting and closing titles, the browser); the same two places
+  PS5_AVCAP_ELF      path to avcap.elf for direct screenshots
+  PS5_SCREENSHOT_BACKEND auto (direct when available), avcap (required), or gallery
+  PS5_FFMPEG     optional FFmpeg executable; otherwise imageio-ffmpeg supplies it
   PS5_PAYLOAD_DIR    where "ps5-mcp fetch-payloads" puts both, searched after the two places above
                      (default ~/.ps5-mcp/payloads)
   PS5_USER_ID     user id in hex; default: the first folder under /user/home
@@ -37,6 +39,7 @@ Configuration (environment):
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import ftplib
 import json
 import re
@@ -75,12 +78,12 @@ def ps5_screenshot(max_width: int = 1280, crop: Crop | None = None) -> Image:
     crop: (left, top, right, bottom) as fractions 0..1 of the screen, e.g. (0.5, 0, 1, 0.5) for the top right
       quarter. The crop is cut from the full-resolution screenshot, so it shows small text more sharply than
       the whole screen scaled down.
-    Works by holding the virtual controller's Create button, which saves a screenshot to the console's
-    gallery, from where it is fetched over FTP. Takes a few seconds; the first one with a newly added controller
-    ~20 s, as it answers the console's "Who's using this controller?" prompt first.
+    Uses direct Avcap2 capture on firmware 13.00 with SDR output when its payload and decoder are installed.
+    This does not press Create, attach a controller or add gallery entries. The auto backend uses the gallery
+    on unsupported configurations or missing prerequisites. PS5_SCREENSHOT_BACKEND=avcap requires direct
+    capture; gallery forces the older Create-button method (which can need user assignment on its first use).
     """
-    with _lock, eye.session():
-        eye.attach()
+    with _lock:
         data = _shoot(max_width, crop)
     return Image(data=data, format="jpeg")
 
@@ -175,8 +178,10 @@ def ps5_sequence(steps: list[Step]) -> list:
             parse_buttons(s.buttons or "")
     out: list = []
     log: list[str] = []
-    with _lock, eye.session():
-        eye.attach()
+    needs_pad = any(s.action in ("press", "stick", "touch") for s in steps)
+    with _lock, eye.session() if needs_pad else nullcontext():
+        if needs_pad:
+            eye.attach()
         for i, s in enumerate(steps, 1):
             try:
                 if s.action == "press":
@@ -190,7 +195,10 @@ def ps5_sequence(steps: list[Step]) -> list:
                     _touch(s.x, s.y, s.to_x, s.to_y, s.duration_ms, s.click)
                     log.append(f"{i}. touch at ({s.x}, {s.y})")
                 elif s.action == "wait":
-                    eye.wait(s.duration_ms / 1000)
+                    if needs_pad:
+                        eye.wait(s.duration_ms / 1000)
+                    else:
+                        time.sleep(max(0, s.duration_ms / 1000))
                     log.append(f"{i}. waited {s.duration_ms} ms")
                 else:
                     out.append("\n".join(log) + f"\n{i}. screenshot:")
@@ -717,7 +725,7 @@ def ps5_status() -> str:
 def ps5_selftest(screenshot: bool = False) -> str:
     """Check every part the tools rely on and report each as ok or FAIL with the reason: the console and its
     firmware, the loader, FTP, the user, RemoteEye, title calls, the title list, the kernel log and Remote Play
-    pairing. Changes nothing on the console; screenshot=true also takes one (it adds a picture to the gallery).
+    pairing. Changes nothing on the console; screenshot=true also takes one (gallery backend adds a picture).
     Good to run first on a new console or firmware, and to paste into a bug report."""
     results = []
 

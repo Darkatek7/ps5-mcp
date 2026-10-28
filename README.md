@@ -8,15 +8,19 @@ look, press, look again, close — without a capture card or Remote Play.
 ```
 Claude ── MCP (stdio) ── server.py ──┬── TCP ── RemoteEye payload ──┬── /dev/hid ── virtual controller
                                      │                              └── titles, browser, rest mode, power off
-                                     ├── FTP ── ftpsrv ── screenshot from the console's gallery, files
+                                     ├── ELF ── Avcap2 payload ── direct screen capture (FW 13.00 SDR)
+                                     ├── FTP ── ftpsrv ── capture transfer, gallery fallback, files
                                      ├── TCP ── klogsrv ── kernel log
                                      └── UDP ── Remote Play discovery ── power state, wake from rest mode
 ```
 
 - **Input:** the `RemoteEye` payload adds a *virtual controller* through the same kernel device Remote Play
   uses and feeds it button and stick states. Verified in the system UI and inside homebrew apps.
-- **Screen:** the virtual controller holds **Create**, the console saves a screenshot to its gallery, and
-  the server fetches it over FTP and scales it down (~4 s per screenshot, full composited screen).
+- **Screen:** direct Avcap2 capture returns the composited screen on firmware 13.00 with SDR output,
+  without controller input or gallery entries. The server sends a short-lived capture payload, fetches its
+  H.264 output over FTP, decodes a frame with FFmpeg and applies the requested crop/size. `auto` uses the
+  older Create-button/gallery backend if the direct payload or decoder is missing, or firmware/HDR is unsupported.
+  Capture errors and busy streaming resources are reported instead of silently pressing buttons.
 - **Titles and power:** RemoteEye (build 7 and newer) asks the system to start or close a title, names the
   app in front, opens the web browser, puts the console in rest mode or turns it off. With an older RemoteEye
   the small `titlectl` payload does it instead: the server writes the action into the ELF, sends it, and reads
@@ -79,7 +83,7 @@ Buttons: `cross circle square triangle up down left right l1 r1 l2 r2 l3 r3 opti
   older than build 7 (they then read titlectl's answer from the log)
 - optional: **ShadowMountPlus** with its API on port 10101 for `ps5_rescan`
 
-**Console settings:**
+**Console settings (gallery backend only):**
 - *Settings → Captures and Broadcasts → Shortcuts for Create Button* must be **Standard** (holding Create
   takes a screenshot). With *Easy Screenshots*, holding opens the Create menu instead.
 
@@ -105,7 +109,7 @@ Buttons: `cross circle square triangle up down left right l1 r1 l2 r2 l3 r3 opti
 
 **From a checkout:**
 
-1. Get `RemoteEye.elf` and `titlectl.elf` from the [releases](../../releases) and put them in the repository
+1. Get `RemoteEye.elf`, `titlectl.elf` and, when available, `avcap.elf` from the [releases](../../releases) and put them in the repository
    root (or build them, see below; or `python server/server.py fetch-payloads` puts them in
    `~/.ps5-mcp/payloads`, which the server searches too). You don't have to send them yourself — the server
    does when needed.
@@ -122,11 +126,11 @@ Buttons: `cross circle square triangle up down left right l1 r1 l2 r2 l3 r3 opti
 The server finds the console on the local network by itself; with several consoles (or none answering) set
 `PS5_IP`, e.g. `--env PS5_IP=192.168.1.50`. Then:
 
-1. First use: a new controller appears and the console asks **"Who's using this controller?"** on its
+1. First input or gallery capture: a new controller appears and the console asks **"Who's using this controller?"** on its
    first input; until it is answered, the Create button does nothing. When the first screenshot of a controller
    the server just added fails, the server answers the prompt itself once (right, then cross: the user next to
    it, right on a console with one user) and tries again, so that first screenshot takes ~20 s. With several
-   users, pick yours with your real controller (or `ps5_press`) instead.
+   users, pick yours with your real controller (or `ps5_press`) instead. Direct Avcap2 screenshots do not add a controller.
 2. `ps5_selftest` shows whether everything answers.
 
 ### Configuration
@@ -138,6 +142,9 @@ The server finds the console on the local network by itself; with several consol
 | `PS5_FTP_PORT` / `PS5_FTP_USER` / `PS5_FTP_PASS` | `2121` / `anonymous` / `anonymous` | ftpsrv login |
 | `PS5_REMOTEEYE_ELF` | `payload/RemoteEye/out/RemoteEye.elf`, then `./RemoteEye.elf`, then `PS5_PAYLOAD_DIR` | Payload to start |
 | `PS5_TITLECTL_ELF` | `payload/titlectl/out/titlectl.elf`, then `./titlectl.elf`, then `PS5_PAYLOAD_DIR` | Payload for the title tools |
+| `PS5_AVCAP_ELF` | `payload/avcap/out/avcap.elf`, then `./avcap.elf`, then `PS5_PAYLOAD_DIR` | Direct capture payload |
+| `PS5_SCREENSHOT_BACKEND` | `auto` | `avcap` requires direct capture; `gallery` forces Create-button capture |
+| `PS5_FFMPEG` | bundled decoder from `imageio-ffmpeg` | Optional path to an FFmpeg executable |
 | `PS5_PAYLOAD_DIR` | `~/.ps5-mcp/payloads` | Where `ps5-mcp fetch-payloads` puts the payloads |
 | `PS5_SMP_PORT` | `10101` | ShadowMountPlus API port |
 | `PS5_DELETE_SHOTS` | off | Delete each screenshot after fetching it (see below) |
@@ -147,9 +154,24 @@ The server finds the console on the local network by itself; with several consol
 | `PS5_ELFLDR_PORT` / `PS5_KLOG_PORT` / `PS5_REMOTEEYE_PORTS` | `9021` / `3232` / `3321-3340` | Other ports |
 | `PS5_DDP_PORT` | `9302` | Remote Play discovery port (power state, waking) |
 
-**Screenshots pile up in the Media Gallery.** Deleting them over FTP is possible (`PS5_DELETE_SHOTS=1`) but
+**Gallery-backend screenshots pile up in the Media Gallery.** Deleting them over FTP is possible (`PS5_DELETE_SHOTS=1`) but
 leaves a blank tile per screenshot, because the gallery's database keeps the entry. So by default they stay;
 clear them in the Media Gallery from time to time.
+
+Direct captures use unique `/data/ps5mcp-avcap-<request>.h264` and `.status` files, published only after the
+capture channel and its resource registration have been closed. The server deletes these files after retrieval;
+`PS5_SAVE_DIR` optionally keeps the decoded full-resolution PNG on the PC. A host interruption or timeout can
+leave request files under `/data`; their unique names prevent a later request from returning an old picture.
+Direct capture refuses an already active ResourceArbitrator profile 180, including a conflicting streaming session.
+
+Build the new payload from a checkout using PS5 Payload SDK v0.45:
+
+```sh
+PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk bash payload/avcap/build.sh
+```
+
+The unchanged no-argument ELF still produces the standalone two-second diagnostic capture. The MCP server
+patches its request slot in memory to request a shorter capture and correlate completion without klogsrv.
 
 ### Rest mode and waking
 

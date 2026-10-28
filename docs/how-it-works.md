@@ -30,13 +30,11 @@ ps5-payload-sdk, modules loaded with `sceKernelLoadStartModule` as HearBridge do
   exist) never returns either, so `sceShareCaptureScreenshot` stays out of reach. Neither does
   `sceContentDeleteInitialize` (`libSceContentDelete.sprx`, with the 16 KB heap the service insists on), which
   would remove a screenshot together with its gallery entry.
-- `libSceAvcap2` (live composited frames; HearBridge reads system audio through it) gets further:
-  `sceAvcap2Initialize` returns 0, with or without a changed authid. `sceAvcap2OpenVideo` refuses the
-  configuration SharpProspero documents: kind 1 with the default mode gives `0x80c78000`, kind 0 gives
-  `0x81950001` (invalid argument), kind 2 gives `0x81950008`. With mode 2 and 64 MB of mapped direct memory
-  as the frame area, kind 1 and 2 both give `0x81950008`; mode 1 with a 2 MB second area gives `0x81950001`.
-  The rest of the 0x2B8-byte configuration is undocumented; finding it means reading how the system's own
-  consumers (Remote Play, broadcasting) fill it in.
+- `libSceAvcap2` gets further: a standalone payload can initialize, open a video channel, start it and
+  read a decodable 1920x1080 AVC stream. The first probes used a configuration for a different ABI and
+  omitted the ResourceArbitrator lifecycle. The corrected probe below captures the visible home screen
+  without using the gallery. The server still uses gallery screenshots; the standalone AVC path has
+  not yet been integrated into the MCP tools.
 
 That holds for SharpProspero payloads that load the module themselves at run time. Listed as `DT_NEEDED`
 instead (`<ProsperoSprx>` in the project), `libSceSystemService`, `libSceUserService` and `libSceRegMgr` work:
@@ -62,6 +60,103 @@ System modules are mapped execute-only: reading their code from memory kills the
 `SELF` command switches it to decrypting SELF files on download, which gives a plain ELF of e.g.
 `/system/common/lib/libScePad.sprx`. Exports are named by NID (`base64(sha1(name + suffix)[0:8])`), so
 known names can be matched and disassembled.
+
+## Avcap2 video research (FW 13.00)
+
+On 2026-10-28, the system consumers and Avcap2 service were inspected on the test console. FTP's `SELF`
+command successfully returned ordinary ELF files; a plain download without `SELF` returned the encrypted
+container. No system binaries are included in this repository.
+
+The library's open function is at module-relative `0x360`, and its IPC helper at `0x4480` sends **0x2E0**
+configuration bytes. The earlier SharpProspero description used 0x2B8 bytes and different memory offsets.
+The following offsets are relative to the configuration, not its containing C++ object:
+
+| Offset | Observed field |
+|---|---|
+| `0x10` | Channel kind: the successful scan-in probe uses 0 |
+| `0x14` | Capture purpose: 0 VideoRecording, 1 GameLiveStreaming, 2 Remoteplay, 3 SocialScreen; the probe uses 2 |
+| `0x18` | Resolution enum: 4 produces 1920x1080 |
+| `0x1C` | Timing enum; successful probe value 1, exact timing semantics not established |
+| `0x24` | Codec: 0 AVC, 1 HEVC, 2 uncompressed |
+| `0x28` | ResourceArbitrator id, **not** the signed-in user's id |
+| `0x1A0` | Memory mode, previously assumed to be at 0x188; successful probe uses 0 |
+| `0x1B8`, `0x1C0` | First external area's length/address for memory modes 1/2 |
+| `0x1D8`, `0x1E0` | External frame area's length/address for memory modes 1/2 |
+| `0x2A0` | Current output flags from `sceAvcap2GetVideoOutMode`; observed 0x13C |
+| `0x2A4` | Scan-in target/tap selector: **2** captures the composited SDR screen; 3 selected the app-only source |
+
+The configuration also carries nested size headers. The probe mirrors the system consumer's headers;
+which of them are individually required has not been isolated. See `configure()` in
+[`avcap.c`](../payload/avcap/avcap.c) for the complete tested byte layout.
+
+Before opening the channel, Remote Play registers a callback with `libSceResourceArbitrator`, requests
+`RUNNING` for its resource profile and waits for a successful callback. A bounded reproduction from a
+payload works with profile **180** and the payload's own pid. The service logs a grant of `vcn[20]`,
+`scanin[2K]`, `acp[270]`; Avcap2 then opens successfully with that id at configuration offset 0x28.
+On cleanup, the payload closes capture, requests `STOP` and unregisters the callback. The console logs
+the scan-in slot becoming free again and `No kicking Apps` during these runs. The probe refuses to run
+if profile 180 is already active.
+
+The RA exports are identified by NID; these **13.00-only** module-relative offsets were measured:
+
+| NID | Offset | Observed call shape |
+|---|---|---|
+| `kJvjeet+f9I` | `0xDB0` | Register `(id, callback, userdata)` |
+| `LqmYZGB-UEQ` | `0xEE0` | Unregister `(id)` |
+| `CYjfezkWcaE` | `0x10B0` | Request `(id, state_name, userdata, pid)` |
+| `fBX+DBOwNis` | `0x11F0` | Read the 32 active resource ids into a 128-byte buffer |
+
+`sceAvcap2ReadVideo` needs a **destination buffer and its capacity** as arguments 2 and 3. Passing zero
+for both, as the initial probe did, returns 0x81950001 before consuming a frame. The descriptor is **0x70**
+bytes on this firmware, not 0x68. The successful call is
+`ReadVideo(handle, destination, capacity, descriptor, 1)` with the descriptor's initial uint64 set to
+0x70. Flag 1 is nonblocking; 0x81950002 means no frame yet, and a positive return is the number of bytes
+copied. No direct-memory allocation is needed for the successful memory-mode-0 path.
+
+For a standalone H.264 stream, prepend the SPS/PPS from `sceAvcap2GetNonVclNalUnitStream(handle, info)`.
+Its output is 0x1A8 bytes: uint64 lengths at 0x10, 0x98 and 0x120, each followed by up to 0x80 bytes of
+NAL data. The observed AVC output has a 29-byte SPS and 4-byte PPS. These NALs exclude the Annex B start
+code, so the probe writes `00 00 00 01` before each. The video reads themselves already contain start codes.
+
+The checked-in standalone diagnostic is built with SDK v0.45:
+
+```sh
+PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk bash payload/avcap/build.sh
+```
+
+Send `payload/avcap/out/avcap.elf` with `ps5_send_payload(log_seconds=5)`, then download
+`/data/ps5mcp-avcap.h264`. The probe checks firmware 13.00 before using RA offsets, reads for about
+two seconds, and releases the channel and resource on success and error paths. The final live run logged:
+
+```text
+firmware=0x13000040
+register rc=0
+request RUNNING rc=0
+Initialize rc=0
+GetVideoOutMode rc=0 flags=0x13c
+OpenVideo rc=0
+Start rc=0
+GetNonVclNalUnitStream rc=0
+captured frames=100 bytes=291510
+Stop rc=0 / Close rc=0 / Terminate rc=0
+request STOP rc=0 / unregister rc=0
+```
+
+FFmpeg decodes the stream as H.264, 1920x1080. The original selector **3** at 0x2A4 caused AvControl to
+log `tapPoint = 0x4`. That source produced black frames at the home screen but a correct picture while
+PS5SD was in front: it was capturing the app surface. Remote Play's initial selector is **2**. Using 2
+instead makes AvControl log `tapPoint = 0x3` and produces a visible home-screen frame, including the
+shell's icons, background and text. The fix changes that selector alone; the original resource lifecycle,
+codec, memory mode and protection settings remain in place. Clearing `SetInvalidFrame` and changing the
+initial privacy rectangle did not fix the old source and are not part of the correction.
+
+The rebuilt checked-in probe returned 100 frames / 291510 AVC bytes, compared with about 7.7 KB for
+the previous black stream. The first decoded frame was visually inspected against the console UI.
+PS5SD was closed through its quit file after the app-surface comparison. Stop, close, terminate, resource
+STOP and unregister all returned 0. This demonstrates visible composited-screen capture in SDR on this
+13.00 console. HDR, other firmware versions, a sustained frame rate and a production MCP screenshot
+backend remain unverified. The uncompressed codec opened successfully but failed at `Start` with
+0x80C78000.
 
 ## The virtual controller
 

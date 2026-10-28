@@ -19,6 +19,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
@@ -68,6 +69,7 @@ os.environ.update({
     "PS5_ELFLDR_PORT": str(ELFLDR.getsockname()[1]),
     "PS5_SMP_PORT": str(SMP.server_address[1]),
     "PS5_DDP_PORT": str(DDP.getsockname()[1]),
+    "PS5_SCREENSHOT_BACKEND": "gallery",  # These integration fixtures emulate the gallery.
 })
 # The package sits next to this file, as server/server.py has it.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -133,6 +135,8 @@ class FakeFTP:
         self.put(path, fh.read())
 
     def delete(self, path):
+        if path not in self.files:
+            raise ftplib.error_perm("550 not found")
         del self.files[path]
 
     def mkd(self, path):
@@ -400,6 +404,96 @@ class Input(unittest.TestCase):
     def test_detach(self):
         self.assertIn("detached", srv.ps5_detach())
         self.assertIn("DETACH", eye_server.lines)
+
+
+class DirectScreen(unittest.TestCase):
+    def setUp(self):
+        reset_ftp()
+        eye_server.lines.clear()
+        self.folder = tempfile.TemporaryDirectory()
+        self.addCleanup(self.folder.cleanup)
+        self.elf = Path(self.folder.name, "avcap.elf")
+        self.elf.write_bytes(b"\x7fELF" + b"PS5MCP-CAPTURE-V1:\0" + bytes(33))
+        image = BytesIO()
+        PILImage.new("RGB", (1920, 1080), (35, 100, 180)).save(image, "PNG")
+        self.png = image.getvalue()
+        self.tokens = []
+        self.status = b"0\n"
+        for target, value in (("SCREENSHOT_BACKEND", "avcap"), ("AVCAP_ELF", self.elf)):
+            p = patch.object(config, target, value)
+            p.start()
+            self.addCleanup(p.stop)
+        for target, replacement in (("ffmpeg_exe", lambda: "ffmpeg"),
+                                     ("decode_avc", lambda raw, exe: self.png)):
+            p = patch.object(screen, target, replacement)
+            p.start()
+            self.addCleanup(p.stop)
+        p = patch.object(net, "send_elf", self.sent)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def sent(self, data):
+        token = data.split(b"PS5MCP-CAPTURE-V1:\0", 1)[1][:32].decode()
+        self.assertRegex(token, r"^[0-9a-f]{32}$")
+        self.tokens.append(token)
+        base = f"/data/ps5mcp-avcap-{token}"
+        FakeFTP.put(base + ".status", self.status)
+        if self.status == b"0\n":
+            FakeFTP.put(base + ".h264", b"fixture AVC")
+
+    def test_direct_capture_unique_fresh_files_crop_and_no_controller(self):
+        before = dict(FakeFTP.files)
+        for _ in range(2):
+            result = srv.ps5_screenshot(max_width=320, crop=(0.5, 0, 1, 0.5))
+            self.assertEqual(PILImage.open(BytesIO(result.data)).size, (320, 180))
+        self.assertEqual(len(set(self.tokens)), 2)
+        self.assertEqual(FakeFTP.files, before)
+        self.assertEqual(eye_server.lines, [])
+
+    def test_direct_sequence_does_not_connect_controller(self):
+        result = srv.ps5_sequence([srv.Step(action="wait", duration_ms=0), srv.Step(action="screenshot")])
+        self.assertIsInstance(result[1], srv.Image)
+        self.assertEqual(eye_server.lines, [])
+
+    def test_busy_and_failed_capture_never_fall_back_to_button_presses(self):
+        with patch.object(config, "SCREENSHOT_BACKEND", "auto"):
+            for status, message in ((b"4\n", "already active"), (b"1\n", "capture failed")):
+                self.status = status
+                with self.assertRaisesRegex(RuntimeError, message):
+                    srv.ps5_screenshot()
+                self.assertFalse(any("avcap-" in p for p in FakeFTP.files))
+        self.assertEqual(eye_server.lines, [])
+
+    def test_auto_falls_back_only_for_unsupported_configuration(self):
+        self.status = b"3\n"
+        with patch.object(config, "SCREENSHOT_BACKEND", "auto"), patch.object(screen, "_shoot_gallery", return_value=b"jpg") as gallery:
+            self.assertEqual(srv.ps5_screenshot().data, b"jpg")
+            gallery.assert_called_once()
+        self.assertFalse(any("avcap-" in p for p in FakeFTP.files))
+
+    def test_strict_mode_reports_unsupported_firmware(self):
+        self.status = b"2\n"
+        with self.assertRaisesRegex(screen.AvcapUnavailable, "13.00"):
+            srv.ps5_screenshot()
+        self.assertEqual(eye_server.lines, [])
+
+    def test_invalid_image_options_do_not_deploy(self):
+        for options in ({"max_width": 0}, {"crop": (0, 0, 0, 1)}, {"crop": (0, 0, float("nan"), 1)}):
+            with self.assertRaises(ValueError):
+                srv.ps5_screenshot(**options)
+        self.assertEqual(self.tokens, [])
+
+    def test_old_payload_is_rejected_before_deployment(self):
+        self.elf.write_bytes(b"\x7fELF old probe")
+        with self.assertRaisesRegex(RuntimeError, "request slot"):
+            srv.ps5_screenshot()
+        self.assertEqual(self.tokens, [])
+
+    def test_timeout_does_not_fetch_an_old_capture(self):
+        with patch.object(net, "send_elf"), patch.object(screen.time, "monotonic", side_effect=[0, 21]):
+            with self.assertRaisesRegex(RuntimeError, "20 s"):
+                srv.ps5_screenshot()
+        self.assertEqual(eye_server.lines, [])
 
 
 class Screen(unittest.TestCase):

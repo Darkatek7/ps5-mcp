@@ -89,6 +89,9 @@ def payload(env: str, build: Path, name: str) -> Path:
 REMOTEEYE_ELF = payload("PS5_REMOTEEYE_ELF", REPO / "payload" / "RemoteEye" / "out" / "RemoteEye.elf",
                         "RemoteEye.elf")
 TITLECTL_ELF = payload("PS5_TITLECTL_ELF", REPO / "payload" / "titlectl" / "out" / "titlectl.elf", "titlectl.elf")
+AVCAP_ELF = payload("PS5_AVCAP_ELF", REPO / "payload" / "avcap" / "out" / "avcap.elf", "avcap.elf")
+SCREENSHOT_BACKEND = os.environ.get("PS5_SCREENSHOT_BACKEND", "auto").lower()
+FFMPEG = os.environ.get("PS5_FFMPEG", "")
 SMP_PORT = int(os.environ.get("PS5_SMP_PORT", "10101"))
 REGIST_KEY = os.environ.get("PS5_REGIST_KEY", "")
 REGIST_FILE = Path(os.environ.get("PS5_REGIST_FILE") or Path.home() / ".ps5-mcp" / "regist.json")

@@ -1,4 +1,4 @@
-"""ps5-mcp fetch-payloads: RemoteEye.elf and titlectl.elf from the latest release, checked against its SHA256SUMS."""
+"""Fetch release payloads, including Avcap2 when available, checked against SHA256SUMS."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from pathlib import Path
 
 RELEASES = "https://api.github.com/repos/Darkatek7/ps5-mcp/releases/latest"
 PAYLOADS = ("RemoteEye.elf", "titlectl.elf")
+OPTIONAL_PAYLOADS = ("avcap.elf",)  # Releases before direct capture have only the original pair.
 
 
 def _get(url: str) -> bytes:
@@ -28,7 +29,7 @@ def fetch_payloads(folder: Path, releases: str = RELEASES) -> list[str]:
                 if line.strip())
     folder.mkdir(parents=True, exist_ok=True)
     report = []
-    for name in PAYLOADS:
+    for name in PAYLOADS + tuple(n for n in OPTIONAL_PAYLOADS if n in assets):
         if name not in assets or name not in sums:
             raise RuntimeError(f"release {release.get('tag_name')} has no {name}")
         data = _get(assets[name])

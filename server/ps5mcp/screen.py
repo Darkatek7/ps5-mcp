@@ -1,18 +1,21 @@
-"""Screenshots: the gallery, decoding (JPEG XR included) and taking one."""
+"""Direct Avcap2 screenshots and the gallery compatibility backend."""
 
 from __future__ import annotations
 
 import ftplib
+import math
 import subprocess
 import sys
 import tempfile
 import time
+import uuid
+from contextlib import nullcontext
 from io import BytesIO
 from pathlib import Path
 
 from PIL import Image as PILImage
 
-from . import net
+from . import config, net
 from .config import BUTTONS, DELETE_SHOTS, GALLERY, IMAGE_SUFFIXES, JXR2PNG, SAVE_DIR, THUMBNAILS
 from .controls import _press
 from .net import entries
@@ -57,6 +60,7 @@ def decode(raw: bytes, suffix: str, max_width: int,
            crop: tuple[float, float, float, float] | None = None) -> bytes:
     """A screenshot file as a JPEG, cropped to (left, top, right, bottom) in 0..1 of the screen when given,
     then scaled down to max_width."""
+    validate_image_options(max_width, crop)
     if suffix == ".jxr":
         image = decode_jxr(raw, 0 if crop else max_width)
     else:
@@ -140,7 +144,7 @@ def _capture(f: ftplib.FTP, wait_s: float) -> str | None:
     return shot
 
 
-def _shoot(max_width: int, crop: tuple[float, float, float, float] | None) -> bytes:
+def _shoot_gallery(max_width: int, crop: tuple[float, float, float, float] | None) -> bytes:
     with net.ftp() as f:
         # A controller just added is not bound to a user until "Who's using this controller?" is answered, so
         # its first Create does nothing. Only then is the prompt answered (the user to the right, as on a
@@ -173,10 +177,124 @@ def _shoot(max_width: int, crop: tuple[float, float, float, float] | None) -> by
             for p in created:
                 try:
                     f.delete(p)
-                except ftplib.error_perm:
+                except ftplib.all_errors:
                     pass
 
     if SAVE_DIR:
         SAVE_DIR.mkdir(parents=True, exist_ok=True)
         (SAVE_DIR / Path(shot).name).write_bytes(data)
     return decode(bytes(data), Path(shot).suffix.lower(), max_width, crop)
+
+
+def validate_image_options(max_width: int, crop: tuple[float, float, float, float] | None) -> None:
+    if not 1 <= max_width <= 7680:
+        raise ValueError("max_width must be between 1 and 7680")
+    if crop is not None:
+        if (len(crop) != 4 or not all(math.isfinite(v) and 0 <= v <= 1 for v in crop)
+                or crop[0] >= crop[2] or crop[1] >= crop[3]):
+            raise ValueError("crop must be (left, top, right, bottom) with left < right and top < bottom, in 0..1")
+
+
+class AvcapUnavailable(RuntimeError):
+    """The direct backend cannot support this configuration; auto may use the gallery."""
+
+
+def ffmpeg_exe() -> str:
+    if config.FFMPEG:
+        return config.FFMPEG
+    try:
+        from imageio_ffmpeg import get_ffmpeg_exe
+        return get_ffmpeg_exe()
+    except (ImportError, RuntimeError) as exc:
+        raise AvcapUnavailable("Avcap2 needs imageio-ffmpeg (pip install imageio-ffmpeg), "
+                               "or PS5_FFMPEG pointing to ffmpeg") from exc
+
+
+def decode_avc(raw: bytes, executable: str) -> bytes:
+    """Decode the first complete frame without a shell or temporary video file."""
+    try:
+        result = subprocess.run([executable, "-hide_banner", "-loglevel", "error", "-f", "h264",
+                                 "-i", "pipe:0", "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png",
+                                 "pipe:1"], input=raw, capture_output=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"Avcap2 frame decoder failed: {exc}") from exc
+    if result.returncode or not result.stdout:
+        raise RuntimeError("Avcap2 frame could not be decoded: " + result.stderr.decode(errors="replace")[-1000:])
+    return result.stdout
+
+
+def _shoot_avcap(max_width: int, crop: tuple[float, float, float, float] | None) -> bytes:
+    if not config.AVCAP_ELF.is_file():
+        raise AvcapUnavailable(f"Avcap2 payload not found at {config.AVCAP_ELF}; build payload/avcap/build.sh "
+                               "or set PS5_AVCAP_ELF")
+    executable = ffmpeg_exe()  # Fail before launching anything if no decoder is installed.
+    elf = bytearray(config.AVCAP_ELF.read_bytes())
+    marker = b"PS5MCP-CAPTURE-V1:\0"
+    if elf.count(marker) != 1:
+        raise RuntimeError("Avcap2 payload has no unique request slot; rebuild payload/avcap/build.sh")
+    token = uuid.uuid4().hex
+    start = elf.index(marker) + len(marker)
+    if start + 33 > len(elf):
+        raise RuntimeError("Avcap2 payload request slot is truncated")
+    elf[start:start + 33] = token.encode() + b"\0"
+    base = f"/data/ps5mcp-avcap-{token}"
+    with net.ftp() as f:
+        net.send_elf(bytes(elf))
+        try:
+            deadline = time.monotonic() + 20
+            while True:
+                status = bytearray()
+                try:
+                    f.retrbinary("RETR " + base + ".status", status.extend)
+                except ftplib.error_perm as exc:
+                    if not str(exc).startswith("550"):
+                        raise
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("Avcap2 capture did not complete within 20 s; check ps5_klog "
+                                           "and that elfldr is running") from exc
+                    time.sleep(0.1)
+                    continue
+                code = bytes(status).strip()
+                if code in (b"2", b"3"):
+                    raise AvcapUnavailable("Avcap2 currently supports firmware 13.00 with SDR output; "
+                                           "use the gallery backend for this configuration")
+                if code == b"4":
+                    raise RuntimeError("Avcap2 resource 180 is already active; stop the other capture/stream first")
+                if code != b"0":
+                    raise RuntimeError(f"Avcap2 capture failed (status {code!r}); check ps5_klog")
+                raw = bytearray()
+                def collect(chunk: bytes) -> None:
+                    if len(raw) + len(chunk) > 32 * 1024 * 1024:
+                        raise RuntimeError("Avcap2 screenshot exceeded the 32 MiB limit")
+                    raw.extend(chunk)
+                f.retrbinary("RETR " + base + ".h264", collect)
+                break
+        finally:
+            for suffix in (".h264", ".status"):
+                try:
+                    f.delete(base + suffix)
+                except ftplib.all_errors:
+                    pass
+    png = decode_avc(bytes(raw), executable)
+    if SAVE_DIR:
+        SAVE_DIR.mkdir(parents=True, exist_ok=True)
+        (SAVE_DIR / f"avcap-{token}.png").write_bytes(png)
+    return decode(png, ".png", max_width, crop)
+
+
+def _shoot(max_width: int, crop: tuple[float, float, float, float] | None) -> bytes:
+    validate_image_options(max_width, crop)
+    backend = config.SCREENSHOT_BACKEND
+    if backend not in ("auto", "avcap", "gallery"):
+        raise ValueError("PS5_SCREENSHOT_BACKEND must be auto, avcap or gallery")
+    if backend != "gallery":
+        try:
+            return _shoot_avcap(max_width, crop)
+        except AvcapUnavailable:
+            if backend == "avcap":
+                raise
+    # Only the gallery needs a controller; a direct screenshot must never add a
+    # pad or answer the user-selection prompt. The caller holds the shared lock.
+    with nullcontext() if eye.sock is not None else eye.session():
+        eye.attach()
+        return _shoot_gallery(max_width, crop)
