@@ -1,0 +1,18 @@
+# The server's tests: fakes of every console service on localhost, no console needed.
+
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  server:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r server/requirements.txt
+      - run: python -m unittest server/test_server.py

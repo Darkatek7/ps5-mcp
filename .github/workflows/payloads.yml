@@ -1,0 +1,78 @@
+# Builds RemoteEye.elf and titlectl.elf with pinned toolchains, and attaches them to the release of a pushed tag.
+#
+# The pins are what the released builds use; changing one changes the binaries:
+# - .NET SDK 10.0.203 (NativeAOT runtime pack 10.0.7). A build with runtime pack 10.0.14 crashed on FW 13.00
+#   before RemoteEye's own code ran (SIGILL in the payload's start-up); 10.0.7 builds work.
+# - SharpProspero e78aaa1 (Darkatek7/SharpProspero, branch sharpprospero-crt-allproc-fw13).
+# - ps5-payload-sdk v0.45.
+# Rebuilding the same commit gives byte-identical ELFs, except for a 16-byte build id in RemoteEye.elf.
+
+name: payloads
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  titlectl:
+    runs-on: ubuntu-24.04
+    container: debian:trixie
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang and the PS5 payload SDK
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq bash clang-18 lld-18 wget unzip
+          wget -q https://github.com/ps5-payload-dev/sdk/releases/download/v0.45/ps5-payload-sdk.zip -O /tmp/sdk.zip
+          unzip -q -d /opt /tmp/sdk.zip
+      - name: Build
+        run: PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk bash payload/titlectl/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: titlectl
+          path: payload/titlectl/out/titlectl.elf
+
+  remoteeye:
+    runs-on: ubuntu-24.04
+    container: mcr.microsoft.com/dotnet/sdk:10.0.203
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: Darkatek7/SharpProspero
+          ref: e78aaa107cfba578139e9baf6d76a34d2785befc
+          path: SharpProspero
+      - name: Install clang
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq clang lld zlib1g-dev
+      - name: Build
+        run: pwsh -NoProfile -File payload/build.ps1 -SdkRoot "$GITHUB_WORKSPACE/SharpProspero"
+      - name: Check the runtime pack
+        run: grep -aq "10\.0\.7" payload/RemoteEye/out/RemoteEye.elf
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RemoteEye
+          path: payload/RemoteEye/out/RemoteEye.elf
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [titlectl, remoteeye]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          sha256sum RemoteEye.elf titlectl.elf | tee SHA256SUMS
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --notes "Payloads built by CI."
+          gh release upload "$GITHUB_REF_NAME" RemoteEye.elf titlectl.elf SHA256SUMS --clobber
