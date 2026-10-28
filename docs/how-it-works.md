@@ -21,8 +21,20 @@ Called from a payload process, these never return:
 - `sceShareInitialize` (so `sceShareCaptureScreenshot` is out of reach)
 - loading `libSceSystemService`
 
-They talk to system services over IPC, which apparently never answers a payload process. `libSceAvcap2`
-(live composited frames) loads and resolves but was not pursued for the same reason.
+They talk to system services over IPC, which apparently never answers a payload process.
+
+Two tries at a screenshot without the controller and the gallery (FW 13.00, C payloads built with the
+ps5-payload-sdk, modules loaded with `sceKernelLoadStartModule` as HearBridge does):
+
+- `sceShareInitialize` from `libSceShare.native.sprx` (that is its name on the PS5; `libSceShare.sprx` does not
+  exist) never returns either, so `sceShareCaptureScreenshot` stays out of reach.
+- `libSceAvcap2` (live composited frames; HearBridge reads system audio through it) gets further:
+  `sceAvcap2Initialize` returns 0, with or without a changed authid. `sceAvcap2OpenVideo` refuses the
+  configuration SharpProspero documents: kind 1 with the default mode gives `0x80c78000`, kind 0 gives
+  `0x81950001` (invalid argument), kind 2 gives `0x81950008`. With mode 2 and 64 MB of mapped direct memory
+  as the frame area, kind 1 and 2 both give `0x81950008`; mode 1 with a 2 MB second area gives `0x81950001`.
+  The rest of the 0x2B8-byte configuration is undocumented; finding it means reading how the system's own
+  consumers (Remote Play, broadcasting) fill it in.
 
 That holds for SharpProspero payloads that load the module themselves at run time. Listed as `DT_NEEDED`
 instead (`<ProsperoSprx>` in the project), `libSceSystemService`, `libSceUserService` and `libSceRegMgr` work:
