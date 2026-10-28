@@ -27,7 +27,9 @@ Two tries at a screenshot without the controller and the gallery (FW 13.00, C pa
 ps5-payload-sdk, modules loaded with `sceKernelLoadStartModule` as HearBridge does):
 
 - `sceShareInitialize` from `libSceShare.native.sprx` (that is its name on the PS5; `libSceShare.sprx` does not
-  exist) never returns either, so `sceShareCaptureScreenshot` stays out of reach.
+  exist) never returns either, so `sceShareCaptureScreenshot` stays out of reach. Neither does
+  `sceContentDeleteInitialize` (`libSceContentDelete.sprx`, with the 16 KB heap the service insists on), which
+  would remove a screenshot together with its gallery entry.
 - `libSceAvcap2` (live composited frames; HearBridge reads system audio through it) gets further:
   `sceAvcap2Initialize` returns 0, with or without a changed authid. `sceAvcap2OpenVideo` refuses the
   configuration SharpProspero documents: kind 1 with the default mode gives `0x80c78000`, kind 0 gives

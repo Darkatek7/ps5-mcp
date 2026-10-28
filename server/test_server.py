@@ -74,7 +74,7 @@ _spec = importlib.util.spec_from_file_location("ps5_server", Path(__file__).with
 srv = importlib.util.module_from_spec(_spec)
 sys.modules["ps5_server"] = srv
 _spec.loader.exec_module(srv)
-from ps5mcp import config, controls, net, power, screen
+from ps5mcp import config, controls, net, power, remoteeye, screen
 
 
 class FakeFTP:
@@ -157,6 +157,9 @@ class FakeEye(threading.Thread):
         self.tag = tag
         self.lines: list[str] = []
         self.handle = -1
+        # "Who's using this controller?": shown for a new controller when set; right, then cross answers it.
+        self.ask_user = False
+        self.prompt = ""
 
     def run(self) -> None:
         while True:
@@ -174,9 +177,17 @@ class FakeEye(threading.Thread):
             if self.handle == 7:
                 return "OK handle=7 existing"
             self.handle = 7
+            self.prompt = "open" if self.ask_user else ""
             return "OK handle=7 new"
         if line.startswith("STATE"):
-            if int(line.split()[1], 16) & 1 and SHOT not in FakeFTP.files:
+            buttons = int(line.split()[1], 16)
+            if self.prompt:
+                if buttons & 0x20:
+                    self.prompt = "right"
+                elif buttons & 0x4000 and self.prompt == "right":
+                    self.prompt = ""
+                return "OK"
+            if buttons & 1 and SHOT not in FakeFTP.files:
                 image = BytesIO()
                 PILImage.new("RGB", (1920, 1080), (200, 30, 30)).save(image, "PNG")
                 FakeFTP.put(SHOT, image.getvalue())
@@ -408,6 +419,29 @@ class Screen(unittest.TestCase):
         image = srv.ps5_screenshot(max_width=640)
         decoded = PILImage.open(BytesIO(image.data))
         self.assertEqual(decoded.size, (640, 360))
+
+    def test_screenshot_answers_the_prompt_of_a_new_controller(self):
+        srv.ps5_detach()
+        eye_server.ask_user = True
+        try:
+            image = srv.ps5_screenshot(max_width=320)
+        finally:
+            eye_server.ask_user = False
+        self.assertEqual(PILImage.open(BytesIO(image.data)).size, (320, 180))
+        self.assertEqual(eye_server.prompt, "")
+        self.assertIs(remoteeye.eye.assigned, True)
+        # Once answered, a screenshot that fails does not press anything.
+        eye_server.lines.clear()
+        eye_server.prompt = "open"
+        self.addCleanup(setattr, screen, "SHOT_WAIT_S", screen.SHOT_WAIT_S)
+        screen.SHOT_WAIT_S = 1
+        try:
+            with self.assertRaisesRegex(RuntimeError, "no screenshot appeared"):
+                srv.ps5_screenshot(max_width=320)
+        finally:
+            eye_server.prompt = ""
+        self.assertFalse(any(line.startswith("STATE 20") or line.startswith("STATE 4000")
+                             for line in eye_server.lines))
 
     def test_crop(self):
         raw = BytesIO()

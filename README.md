@@ -105,9 +105,10 @@ Buttons: `cross circle square triangle up down left right l1 r1 l2 r2 l3 r3 opti
    on the local network by itself; with several consoles (or none answering) set `PS5_IP`, e.g.
    `--env PS5_IP=192.168.1.50`.
 4. First use: a new controller appears and the console asks **"Who's using this controller?"** on its
-   first input. Pick your user there — with your real controller, or let Claude do it (`ps5_press` to move,
-   `cross` to select). Until then screenshots fail, since the Create button of an unassigned controller does
-   nothing.
+   first input; until it is answered, the Create button does nothing. When the first screenshot of a controller
+   the server just added fails, the server answers the prompt itself once (right, then cross: the user next to
+   it, right on a console with one user) and tries again, so that first screenshot takes ~20 s. With several
+   users, pick yours with your real controller (or `ps5_press`) instead.
 5. `ps5_selftest` shows whether everything answers.
 
 ### Configuration
@@ -221,9 +222,12 @@ registration. CI runs them on every push (`.github/workflows/tests.yml`).
 
 ## Limitations
 
-- One virtual controller, user 1 by default. The console may show a controller-assignment prompt after
-  RemoteEye starts (also after every console restart). While that prompt is open, the real controller can't do
-  anything either; `ps5_detach` closes it.
+- One virtual controller, user 1 by default. The console shows a controller-assignment prompt for a new
+  controller (also after every console restart). The server answers it on the first failed screenshot of a
+  controller it just added, and only then: pressed at another time, cross could act on the running app. While
+  the prompt is open, the real controller can't do anything either; `ps5_detach` closes it.
+- Screenshots go through the gallery and stay there. Removing them from a payload is not possible: the
+  content-delete service, like the share service, never answers a payload (`docs/how-it-works.md`).
 - Input is sent like a real controller sends it: a held button is reported again every 20 ms (`PS5_REPORT_MS`),
   the release three times, and a controller that was just added gets a second before the first input. With one
   report per press, presses were lost while a real DualSense was in use as well.

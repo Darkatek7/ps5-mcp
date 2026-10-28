@@ -14,6 +14,7 @@ from PIL import Image as PILImage
 
 from . import net
 from .config import BUTTONS, DELETE_SHOTS, GALLERY, IMAGE_SUFFIXES, JXR2PNG, SAVE_DIR, THUMBNAILS
+from .controls import _press
 from .net import entries
 from .remoteeye import eye
 
@@ -113,25 +114,47 @@ def decode_jxr(raw: bytes, max_width: int) -> PILImage.Image:
     return image
 
 
+# How long a screenshot may take to appear in the gallery (an HDR one can take several seconds).
+SHOT_WAIT_S = 20
+
+
+def _capture(f: ftplib.FTP, wait_s: float) -> str | None:
+    """Holds Create and returns the gallery path of the screenshot it saved, or None."""
+    before = gallery_dirs(f)
+    end = time.time() + 1.6
+    while time.time() < end:
+        eye.state(BUTTONS["create"])
+        time.sleep(0.1)
+    eye.state(0)
+
+    shot, deadline, last_size = None, time.time() + wait_s, -1
+    while time.time() < deadline:
+        time.sleep(0.5)
+        new = new_shots(f, before)
+        images = [p for p in new if p.lower().endswith(IMAGE_SUFFIXES)]
+        if images:
+            shot = images[0]
+            if new[shot] and new[shot] == last_size:
+                break
+            last_size = new[shot]
+    return shot
+
+
 def _shoot(max_width: int, crop: tuple[float, float, float, float] | None) -> bytes:
     with net.ftp() as f:
-        before = gallery_dirs(f)
-        end = time.time() + 1.6
-        while time.time() < end:
-            eye.state(BUTTONS["create"])
-            time.sleep(0.1)
-        eye.state(0)
-
-        shot, deadline, last_size = None, time.time() + 20, -1
-        while time.time() < deadline:
+        # A controller just added is not bound to a user until "Who's using this controller?" is answered, so
+        # its first Create does nothing. Only then is the prompt answered (the user to the right, as on a
+        # console with one user), and only once: pressed elsewhere, cross could act on the running app.
+        shot = _capture(f, 12 if eye.assigned is False else SHOT_WAIT_S)
+        if not shot and eye.assigned is False:
+            eye.assigned = None
+            _press(BUTTONS["right"], 120, 1, 0)
             time.sleep(0.5)
-            new = new_shots(f, before)
-            images = [p for p in new if p.lower().endswith(IMAGE_SUFFIXES)]
-            if images:
-                shot = images[0]
-                if new[shot] and new[shot] == last_size:
-                    break
-                last_size = new[shot]
+            _press(BUTTONS["cross"], 120, 1, 0)
+            time.sleep(2)
+            shot = _capture(f, SHOT_WAIT_S)
+        if shot:
+            eye.assigned = True
         if not shot:
             raise RuntimeError(
                 "no screenshot appeared in the gallery. Possible causes: the virtual controller is not "

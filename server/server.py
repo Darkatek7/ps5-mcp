@@ -78,7 +78,8 @@ def ps5_screenshot(max_width: int = 1280, crop: Crop | None = None) -> Image:
       quarter. The crop is cut from the full-resolution screenshot, so it shows small text more sharply than
       the whole screen scaled down.
     Works by holding the virtual controller's Create button, which saves a screenshot to the console's
-    gallery, from where it is fetched over FTP. Takes a few seconds.
+    gallery, from where it is fetched over FTP. Takes a few seconds; the first one with a newly added controller
+    ~20 s, as it answers the console's "Who's using this controller?" prompt first.
     """
     with _lock, eye.session():
         eye.attach()

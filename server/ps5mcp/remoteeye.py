@@ -30,6 +30,9 @@ class RemoteEye:
         self.sock: socket.socket | None = None
         self.reader = None
         self.last_call = 0.0
+        # False from adding a controller until a screenshot works: the console asks "Who's using this
+        # controller?" on a new one's first input, and an unanswered prompt leaves Create without effect.
+        self.assigned: bool | None = None
 
     @staticmethod
     def probe(port: int) -> tuple[str, int, socket.socket | None]:
@@ -142,6 +145,7 @@ class RemoteEye:
         if not reply.startswith("OK"):
             raise RuntimeError(reply)
         if reply.endswith(" new"):
+            self.assigned = False
             self.wait(NEW_PAD_SETTLE_S)
         return reply
 
