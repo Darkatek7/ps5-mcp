@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ps5-mcp"
-version = "0.3.1"
+version = "0.4.0"
 description = "MCP server that gives an AI eyes and hands on a jailbroken PS5: screenshots, controller input, titles, files, power"
 readme = "README.md"
 license = "GPL-3.0-only"
